@@ -1,0 +1,54 @@
+name: Search Git objects for original app
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scan reachable and unreachable objects
+        run: |
+          set -euo pipefail
+          git fsck --full --unreachable --dangling --no-reflogs --no-progress > fsck.txt || true
+          echo '=== OBJECT COUNTS ==='
+          wc -l fsck.txt || true
+          echo '=== UNREACHABLE/DANGLING LARGE BLOBS ==='
+          while read -r state type sha extra; do
+            [ "$type" = blob ] || continue
+            size=$(git cat-file -s "$sha" 2>/dev/null || echo 0)
+            [ "$size" -ge 20000 ] || continue
+            head=$(git cat-file blob "$sha" | head -c 120 | tr '\n' ' ' | tr '\r' ' ' || true)
+            echo "$state $sha size=$size head=$head"
+          done < fsck.txt
+          echo '=== ALL LARGE REACHABLE BLOBS ==='
+          git rev-list --objects --all | while read -r sha path; do
+            type=$(git cat-file -t "$sha" 2>/dev/null || true)
+            [ "$type" = blob ] || continue
+            size=$(git cat-file -s "$sha" 2>/dev/null || echo 0)
+            [ "$size" -ge 20000 ] || continue
+            head=$(git cat-file blob "$sha" | head -c 120 | tr '\n' ' ' | tr '\r' ' ' || true)
+            echo "$sha size=$size path=$path head=$head"
+          done | sort -k2,2nr | head -100
+          echo '=== SEARCH TEXTUAL JS SIGNATURES IN UNREACHABLE BLOBS ==='
+          while read -r state type sha extra; do
+            [ "$type" = blob ] || continue
+            size=$(git cat-file -s "$sha" 2>/dev/null || echo 0)
+            [ "$size" -ge 5000 ] || continue
+            tmp=$(mktemp)
+            git cat-file blob "$sha" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+            if grep -aqE 'MUTAGENÊSES|appState|function render|const DB|Voca(ção|cao)|customCapacities|defaultThreats' "$tmp"; then
+              echo "MATCH $state $sha size=$size"
+              strings -n 8 "$tmp" | grep -E 'MUTAGENÊSES|appState|function render|const DB|Voca(ção|cao)|customCapacities|defaultThreats' | head -20 || true
+              cp "$tmp" "match-$sha.bin"
+            fi
+            rm -f "$tmp"
+          done < fsck.txt

@@ -2,4 +2,4 @@
 
 Site do RPG MUTAGENÊSES.
 
-O deploy valida e recupera o núcleo da aplicação antes de publicar no GitHub Pages.
+Recuperação do núcleo do aplicativo e validação do GitHub Pages em andamento.

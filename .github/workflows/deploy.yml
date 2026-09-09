@@ -31,8 +31,43 @@ jobs:
           cat _pristine/seg05-1.txt _pristine/seg05-2.txt _pristine/seg05-3.txt > app-segment-05.txt
           cat _pristine/seg08-1.txt _pristine/seg08-2.txt _pristine/seg08-3.txt > app-segment-08.txt
 
-      - name: Build and verify application bundle
-        run: node build-app.js
+      - name: Rebuild application bundle from merged Base64 stream
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const zlib = require('node:zlib');
+          const vm = require('node:vm');
+
+          const files = Array.from({length: 8}, (_, i) =>
+            `app-segment-${String(i + 1).padStart(2, '0')}.txt`
+          );
+
+          function clean(text) {
+            return String(text ?? '')
+              .replace(/^\uFEFF/, '')
+              .replace(/[\s\u200B\u200C\u200D]/g, '')
+              .replace(/-/g, '+')
+              .replace(/_/g, '/')
+              .replace(/=/g, '');
+          }
+
+          const merged = files.map(file => clean(fs.readFileSync(file, 'utf8'))).join('');
+          if (!merged || merged.length % 4 === 1) {
+            throw new Error(`Base64 final inválido: comprimento=${merged.length}`);
+          }
+
+          const padded = merged + '='.repeat((4 - (merged.length % 4)) % 4);
+          const raw = Buffer.from(padded, 'base64');
+          if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) {
+            throw new Error(`GZIP inválido: assinatura=${raw.subarray(0, 4).toString('hex')}`);
+          }
+
+          const bundle = zlib.gunzipSync(raw).toString('utf8');
+          if (!bundle.trim()) throw new Error('Bundle vazio.');
+          new vm.Script(bundle, {filename: 'mutageneses-app.bundle.js'});
+          fs.writeFileSync('app.bundle.js', bundle, 'utf8');
+          console.log(`PASS: bundle reconstruído e validado; ${bundle.length} caracteres JS; ${raw.length} bytes GZIP.`);
+          NODE
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

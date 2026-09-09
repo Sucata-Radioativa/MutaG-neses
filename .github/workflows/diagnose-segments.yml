@@ -15,27 +15,58 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: List segment history
+      - name: Search historical app-part combinations
         run: |
+          set -euo pipefail
           node <<'NODE'
-          const {execFileSync} = require('node:child_process');
-          const files = Array.from({length:8}, (_,i)=>`app-segment-${String(i+1).padStart(2,'0')}.txt`);
-          function sh(args){ return execFileSync('git',args,{encoding:'utf8'}).trim(); }
-          for (const file of files) {
-            const commits = sh(['log','--all','--format=%H|%ad|%s','--date=iso-strict','--',file]).split('\n').filter(Boolean);
-            const seen = new Map();
-            for (const row of commits) {
-              const [sha,date,...msg] = row.split('|');
-              let blob='';
-              try { blob = sh(['rev-parse',`${sha}:${file}`]); } catch { continue; }
-              if (!seen.has(blob)) seen.set(blob,{sha,date,msg:msg.join('|')});
+          const {execFileSync}=require('node:child_process');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'}).trim();
+          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/');
+          function decode(s){s=clean(s);if(!s||!/^[A-Za-z0-9+/]*={0,2}$/.test(s)||s.length%4===1)return null;if(s.length%4)s+='='.repeat(4-s.length%4);return Buffer.from(s,'base64');}
+          const all=[];
+          for(let i=1;i<=8;i++){
+            const f=`app-part-${String(i).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H','--',f]).split(/\s+/).filter(Boolean);
+            const seen=new Map();
+            for(const c of commits){
+              try{const blob=sh(['rev-parse',`${c}:${f}`]);if(seen.has(blob))continue;const text=sh(['show',`${c}:${f}`]);const bytes=decode(text);if(bytes)seen.set(blob,{blob,commit:c,bytes,chars:clean(text).length});}catch{}
             }
-            console.log(`\n${file}: ${seen.size} unique blobs`);
-            let n=0;
-            for (const [blob,info] of seen) {
-              let size='?';
-              try { size = sh(['cat-file','-s',blob]); } catch {}
-              console.log(`  ${++n}. blob=${blob} size=${size} commit=${info.sha.slice(0,10)} date=${info.date} msg=${info.msg}`);
-            }
+            all.push([...seen.values()]);
+            console.log(`PART ${i}: ${all[i-1].length} candidates`);
+            for(const x of all[i-1])console.log(`  ${x.blob} chars=${x.chars} bytes=${x.bytes.length} head=${x.bytes.subarray(0,8).toString('hex')}`);
           }
+          let tested=0,found=null;const pick=[];
+          function rec(i){
+            if(found)return;
+            if(i===8){
+              tested++;const raw=Buffer.concat(pick.map(x=>x.bytes));
+              if(raw.length<2||raw[0]!==0x1f||raw[1]!==0x8b)return;
+              try{const out=zlib.gunzipSync(raw).toString('utf8');new Function(out);found={raw,out,parts:pick.map((x,j)=>({part:j+1,blob:x.blob,commit:x.commit,chars:x.chars,bytes:x.bytes.length}))};}catch{}
+              return;
+            }
+            for(const x of all[i]){pick.push(x);rec(i+1);pick.pop();if(found)return;}
+          }
+          rec(0);
+          console.log(`COMBINATIONS=${tested}`);
+          if(!found){
+            console.log('NO_VALID_APP_PART_COMBINATION');
+            process.exit(1);
+          }
+          console.log(`FOUND source=${found.out.length} sha256=${crypto.createHash('sha256').update(found.out).digest('hex')}`);
+          console.log(JSON.stringify(found.parts,null,2));
           NODE
+      - name: Search dangling Git objects
+        run: |
+          git fsck --full --unreachable --no-reflogs --no-progress | tee fsck.txt || true
+          echo 'Unreachable large blobs:'
+          while read -r a b sha; do
+            [ "$a" = unreachable ] || [ "$a" = dangling ] || continue
+            type=$(git cat-file -t "$sha" 2>/dev/null || true)
+            [ "$type" = blob ] || continue
+            size=$(git cat-file -s "$sha" 2>/dev/null || true)
+            [ "${size:-0}" -ge 4000 ] || continue
+            head=$(git cat-file blob "$sha" | head -c 80 | tr '\n' ' ' || true)
+            echo "$sha size=$size head=$head"
+          done < fsck.txt

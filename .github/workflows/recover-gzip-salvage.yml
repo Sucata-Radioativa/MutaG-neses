@@ -1,0 +1,81 @@
+name: Salvage damaged gzip members
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  salvage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Build zlib salvage binary
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz -o /tmp/zlib.tar.gz
+          tar -xzf /tmp/zlib.tar.gz -C /tmp
+          cd /tmp/zlib-1.3.1
+          CFLAGS='-O2 -DINFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR' ./configure --static >/tmp/zconf.log
+          make -j2 >/tmp/zmake.log
+          cat >/tmp/salvage.c <<'C'
+          #include <stdio.h>
+          #include <zlib.h>
+          int main(int argc,char**argv){
+            if(argc!=3){fprintf(stderr,"usage: salvage input.gz output\n");return 2;}
+            gzFile in=gzopen(argv[1],"rb"); if(!in){fprintf(stderr,"open fail\n");return 3;}
+            FILE*out=fopen(argv[2],"wb"); if(!out){fprintf(stderr,"output fail\n");return 4;}
+            unsigned char buf[65536]; int n,total=0;
+            while((n=gzread(in,buf,sizeof(buf)))>0){if(fwrite(buf,1,n,out)!=(size_t)n)return 5;total+=n;}
+            int err=0; const char*msg=gzerror(in,&err);
+            fprintf(stderr,"total=%d err=%d msg=%s\n",total,err,msg?msg:"");
+            gzclose(in);fclose(out);return 0;
+          }
+          C
+          gcc -O2 /tmp/salvage.c -I. /tmp/zlib-1.3.1/libz.a -o /tmp/salvage
+      - name: Prepare candidates
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs=require('node:fs'), {execFileSync}=require('node:child_process');
+          function rawFromB64(s){
+            s=String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+            // Node's base64 decoder tolerates an incomplete final quartet; retain every complete byte it can decode.
+            return Buffer.from(s,'base64');
+          }
+          function write(name,text){fs.writeFileSync(`/tmp/${name}.gz`,rawFromB64(text));console.log(name,fs.statSync(`/tmp/${name}.gz`).size)}
+          write('seg01-current',fs.readFileSync('app-segment-01.txt','utf8'));
+          write('seg08-current',fs.readFileSync('app-segment-08.txt','utf8'));
+          write('seg05-current',fs.readFileSync('app-segment-05.txt','utf8'));
+          const join=(files)=>files.map(f=>fs.readFileSync(f,'utf8')).join('');
+          write('seg01-pristine',join(['_pristine/seg01-1.txt','_pristine/seg01-2.txt','_pristine/seg01-3.txt']));
+          write('seg05-pristine',join(['_pristine/seg05-1.txt','_pristine/seg05-2.txt','_pristine/seg05-3.txt']));
+          write('seg08-pristine',join(['_pristine/seg08-1.txt','_pristine/seg08-2.txt','_pristine/seg08-3.txt']));
+          NODE
+      - name: Salvage readable output
+        run: |
+          set +e
+          : > salvage-report.txt
+          for f in /tmp/*.gz; do n=$(basename "$f" .gz); /tmp/salvage "$f" "recovered-$n.js" >> salvage-report.txt 2>&1; echo "exit=$? $n size=$(wc -c < recovered-$n.js 2>/dev/null || echo 0)" >> salvage-report.txt; done
+          cat salvage-report.txt
+          set -e
+          node <<'NODE'
+          const fs=require('node:fs');
+          for(const f of fs.readdirSync('.').filter(f=>/^recovered-.*\.js$/.test(f)).sort()){
+            const s=fs.readFileSync(f,'utf8'); let syntax='FAIL'; try{new Function(s);syntax='PASS'}catch(e){syntax=e.message}
+            console.log(`${f}: chars=${s.length} syntax=${syntax} head=${JSON.stringify(s.slice(0,100))} tail=${JSON.stringify(s.slice(-100))}`)
+          }
+          NODE
+      - name: Upload salvage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gzip-salvage-results
+          path: |
+            salvage-report.txt
+            recovered-*.js
+          if-no-files-found: error

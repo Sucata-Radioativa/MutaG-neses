@@ -1,0 +1,41 @@
+name: Diagnose historical app segments
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: List segment history
+        run: |
+          node <<'NODE'
+          const {execFileSync} = require('node:child_process');
+          const files = Array.from({length:8}, (_,i)=>`app-segment-${String(i+1).padStart(2,'0')}.txt`);
+          function sh(args){ return execFileSync('git',args,{encoding:'utf8'}).trim(); }
+          for (const file of files) {
+            const commits = sh(['log','--all','--format=%H|%ad|%s','--date=iso-strict','--',file]).split('\n').filter(Boolean);
+            const seen = new Map();
+            for (const row of commits) {
+              const [sha,date,...msg] = row.split('|');
+              let blob='';
+              try { blob = sh(['rev-parse',`${sha}:${file}`]); } catch { continue; }
+              if (!seen.has(blob)) seen.set(blob,{sha,date,msg:msg.join('|')});
+            }
+            console.log(`\n${file}: ${seen.size} unique blobs`);
+            let n=0;
+            for (const [blob,info] of seen) {
+              let size='?';
+              try { size = sh(['cat-file','-s',blob]); } catch {}
+              console.log(`  ${++n}. blob=${blob} size=${size} commit=${info.sha.slice(0,10)} date=${info.date} msg=${info.msg}`);
+            }
+          }
+          NODE

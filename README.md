@@ -17,11 +17,19 @@ Sistema e plataforma online de RPG pós-apocalíptico, com foco em fichas digita
 3. Entre na conta para acessar suas fichas.
 4. Criações feitas após o login são salvas no Supabase.
 
+## Comunidades
+
+- O dono de uma comunidade recebe um código de entrada.
+- Outro jogador pode usar **Entrar em comunidade** para participar.
+- Cada jogador mantém sua própria conta e suas próprias fichas.
+- Uma ficha pode ser vinculada à comunidade para aparecer como personagem compartilhado.
+- O dono da ficha continua sendo a única conta que possui o personagem original.
+
 ## Segurança
 
 O frontend usa apenas a **publishable key** do Supabase. Chaves secretas não devem ser colocadas neste repositório.
 
-As tabelas usam Row Level Security (RLS) para separar os dados por usuário.
+As tabelas usam Row Level Security (RLS) para separar os dados por usuário e controlar o acesso compartilhado.
 
 ## Publicação
 
@@ -39,11 +47,9 @@ Migrations aplicadas:
 - `shared_link_role_permissions`
 - `fix_character_sharing_rls_and_add_community_invites`
 - `harden_public_function_grants`
+- `fix_character_community_rls_and_image_storage`
+- `enable_community_roster_access`
 
-## Próximas evoluções
+## Estado
 
-- Sincronização completa de comunidades e seus membros.
-- Armazenamento de imagens no Supabase Storage.
-- Convites e entrada por código/link.
-- Compartilhamento de ficha com permissões completas.
-- Sincronização em tempo real durante a sessão.
+A base online está pronta para o primeiro acesso: contas, dados separados por usuário, comunidades, códigos de entrada, personagens compartilhados e criações autorais já possuem estrutura no Supabase. O frontend principal está no repositório e usa a publishable key do projeto.

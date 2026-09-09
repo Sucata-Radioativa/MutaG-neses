@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Recover and build application from a valid historical payload
+      - name: Recover valid application bundle from segment history
         run: |
           node <<'NODE'
           const {execFileSync} = require('node:child_process');
@@ -34,16 +34,13 @@ jobs:
           const zlib = require('node:zlib');
           const vm = require('node:vm');
 
-          const names = Array.from({length: 8}, (_, i) => `app-part-${String(i + 1).padStart(2, '0')}.txt`);
+          const names = Array.from({length: 8}, (_, i) => `app-segment-${String(i + 1).padStart(2, '0')}.txt`);
           const commits = execFileSync('git', ['log', '--format=%H', '--', ...names], {encoding: 'utf8'})
             .trim().split(/\s+/).filter(Boolean);
 
           function readAt(commit, file) {
-            try {
-              return execFileSync('git', ['show', `${commit}:${file}`], {encoding: 'utf8'});
-            } catch {
-              return null;
-            }
+            try { return execFileSync('git', ['show', `${commit}:${file}`], {encoding: 'utf8'}); }
+            catch { return null; }
           }
 
           function clean(text) {
@@ -54,58 +51,51 @@ jobs:
               .replace(/_/g, '/');
           }
 
-          function decodePart(text) {
+          function decode(text) {
             let s = clean(text);
             if (!s || !/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 === 1) return null;
             if (s.length % 4) s += '='.repeat(4 - (s.length % 4));
             try { return Buffer.from(s, 'base64'); } catch { return null; }
           }
 
-          function tryDecodedIndividually(parts) {
-            const decoded = parts.map(decodePart);
+          function tryBundle(parts) {
+            const decoded = parts.map(decode);
             if (decoded.some(x => !x)) return null;
-            const raw = Buffer.concat(decoded);
-            if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) return null;
-            try {
-              const core = zlib.gunzipSync(raw).toString('utf8');
-              if (!core.trim()) return null;
-              new vm.Script(core);
-              return {mode: 'per-part', core, raw};
-            } catch { return null; }
-          }
-
-          function tryMergedBase64(parts) {
-            let merged = parts.map(clean).join('');
-            if (!merged || !/^[A-Za-z0-9+/]*={0,2}$/.test(merged) || merged.length % 4 === 1) return null;
-            if (merged.length % 4) merged += '='.repeat(4 - (merged.length % 4));
-            const raw = Buffer.from(merged, 'base64');
-            if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) return null;
-            try {
-              const core = zlib.gunzipSync(raw).toString('utf8');
-              if (!core.trim()) return null;
-              new vm.Script(core);
-              return {mode: 'merged', core, raw};
-            } catch { return null; }
+            const sources = [];
+            for (const raw of decoded) {
+              if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) return null;
+              try { sources.push(zlib.gunzipSync(raw).toString('utf8')); }
+              catch { return null; }
+            }
+            const core = sources.join('');
+            if (!core.trim()) return null;
+            try { new vm.Script(core, {filename: 'mutageneses-core.js'}); }
+            catch { return null; }
+            return {core, bytes: decoded.reduce((n, b) => n + b.length, 0)};
           }
 
           let found = null;
           for (const commit of commits) {
             const parts = names.map(name => readAt(commit, name));
             if (parts.some(x => x === null)) continue;
-            found = tryDecodedIndividually(parts) || tryMergedBase64(parts);
-            if (found) {
-              console.log(`FOUND valid payload at ${commit} using ${found.mode}.`);
-              fs.writeFileSync('.found-payload-commit', commit, 'utf8');
-              fs.writeFileSync('app.bundle.js', found.core + '\n;\n' + fs.readFileSync('cloud-boot.js', 'utf8'), 'utf8');
-              new vm.Script(fs.readFileSync('app.bundle.js', 'utf8'), {filename: 'app.bundle.js'});
-              console.log(`PASS: app.bundle.js valid; ${found.core.length} core chars; ${found.raw.length} gzip bytes.`);
+            const candidate = tryBundle(parts);
+            if (candidate) {
+              found = {commit, ...candidate};
               break;
             }
           }
 
           if (!found) {
-            throw new Error('Nenhuma versão histórica de app-part-01..08 produz um GZIP válido.');
+            throw new Error('Nenhum conjunto histórico de app-segment-01..08 produz um bundle GZIP válido.');
           }
+
+          console.log(`FOUND valid payload at ${found.commit}; ${found.core.length} caracteres JS; ${found.bytes} bytes GZIP.`);
+          const cloud = fs.readFileSync('cloud-boot.js', 'utf8');
+          const bundle = `${found.core}\n;\n${cloud}`;
+          new vm.Script(bundle, {filename: 'app.bundle.js'});
+          fs.writeFileSync('app.bundle.js', bundle, 'utf8');
+          fs.writeFileSync('.found-payload-commit', found.commit, 'utf8');
+          console.log('PASS: app.bundle.js reconstruído e validado.');
           NODE
 
       - name: Configure Pages

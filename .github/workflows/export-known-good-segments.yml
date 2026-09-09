@@ -1,0 +1,34 @@
+name: Export known good segments
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Export known good segment 5
+        run: |
+          git show bf6225a5da1c79cf808b743f6a63e455f9b15968:app-segment-05.txt > segment-05-known-good.txt
+          node - <<'NODE'
+          const fs=require('node:fs'), zlib=require('node:zlib'), crypto=require('node:crypto');
+          const s=fs.readFileSync('segment-05-known-good.txt','utf8').replace(/\s/g,'');
+          const raw=Buffer.from(s,'base64');
+          const src=zlib.gunzipSync(raw).toString('utf8');
+          fs.writeFileSync('segment-05-known-good.js',src);
+          fs.writeFileSync('segment-05-known-good.sha256',crypto.createHash('sha256').update(src).digest('hex'));
+          console.log(`b64=${s.length} gzip=${raw.length} js=${src.length}`);
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: known-good-segment-05
+          path: |
+            segment-05-known-good.txt
+            segment-05-known-good.js
+            segment-05-known-good.sha256
+          retention-days: 7

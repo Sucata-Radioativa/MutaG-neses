@@ -1,1 +1,1 @@
-/* placeholder */
+const DB = {};

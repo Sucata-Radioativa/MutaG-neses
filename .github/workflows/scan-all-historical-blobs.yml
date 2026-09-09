@@ -1,0 +1,53 @@
+name: Scan all historical blobs
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scan every historical blob
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'});
+          const blobs=sh(['rev-list','--objects','--all']).split(/\n/).filter(Boolean).map(x=>x.split(/\s+/)[0]);
+          const uniq=[...new Set(blobs)];
+          console.log(`historical objects: ${uniq.length}`);
+          const hits=[];
+          for(const sha of uniq){
+            let type,size,data;
+            try{type=execFileSync('git',['cat-file','-t',sha],{encoding:'utf8'}).trim();if(type!=='blob')continue;size=Number(execFileSync('git',['cat-file','-s',sha],{encoding:'utf8'}));if(size<500)continue;data=execFileSync('git',['cat-file','blob',sha]);}catch{continue;}
+            const text=data.toString('utf8');
+            let score=0, kind=[];
+            if(/const\s+DB\s*=|function\s+render\(|appState|MUTAGENÊSES|choosePage\(|bootstrapV20\(|cloud-boot/.test(text)){score+=1000;kind.push('known-js');}
+            if(/<html|<script|addEventListener\(|localStorage\./.test(text)){score+=100;kind.push('web-source');}
+            const cleaned=text.replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+            if(/^[A-Za-z0-9+/]+$/.test(cleaned) && cleaned.length%4!==1){
+              try{const raw=Buffer.from(cleaned+'='.repeat((4-cleaned.length%4)%4),'base64');if(raw[0]===0x1f&&raw[1]===0x8b){score+=800;kind.push('base64-gzip');try{const src=zlib.gunzipSync(raw).toString('utf8');score+=2000;fs.writeFileSync(`hit-${sha}.js`,src);hits.push({sha,size,score,kind,js:src.length,sha256:crypto.createHash('sha256').update(src).digest('hex')});continue;}catch(e){kind.push('gzip-corrupt');}}}catch{}}
+            if(score>0){fs.writeFileSync(`hit-${sha}.txt`,text);hits.push({sha,size,score,kind});}
+          }
+          hits.sort((a,b)=>b.score-a.score);
+          console.log(`HITS ${hits.length}`);
+          hits.slice(0,100).forEach((x,i)=>console.log(`${i+1}. ${JSON.stringify(x)}`));
+          fs.writeFileSync('historical-blob-hits.json',JSON.stringify(hits,null,2));
+          NODE
+      - name: Upload historical blob hits
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-blob-hits
+          path: |
+            historical-blob-hits.json
+            hit-*.js
+            hit-*.txt
+          retention-days: 7

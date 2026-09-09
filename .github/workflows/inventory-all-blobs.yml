@@ -1,0 +1,37 @@
+name: Inventory all historical blobs
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Inventory source-like blobs
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const fs=require('node:fs');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'});
+          const rows=sh(['rev-list','--objects','--all']).split('\n').filter(Boolean);
+          const paths=new Map();
+          for(const row of rows){const [sha,...rest]=row.split(' ');const path=rest.join(' ');if(!paths.has(sha))paths.set(sha,[]);if(path)paths.get(sha).push(path)}
+          const objs=[];
+          for(const [sha,ps] of paths){let type,size;try{type=sh(['cat-file','-t',sha]).trim();size=Number(sh(['cat-file','-s',sha]));}catch{continue}if(type==='blob'&&size>=4000)objs.push({sha,size,paths:ps});}
+          objs.sort((a,b)=>b.size-a.size);
+          for(const x of objs){let preview='';try{preview=execFileSync('git',['cat-file','blob',x.sha],{encoding:'utf8'}).slice(0,500).replace(/\s+/g,' ');}catch{};x.preview=preview;}
+          fs.writeFileSync('blob-inventory.json',JSON.stringify(objs,null,2));
+          console.log(`blobs >=4KB: ${objs.length}`);
+          objs.slice(0,200).forEach(x=>console.log(JSON.stringify(x)));
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: all-blob-inventory
+          path: blob-inventory.json
+          retention-days: 7

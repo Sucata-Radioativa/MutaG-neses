@@ -1,0 +1,82 @@
+name: Auto recover app
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+    paths-ignore:
+      - recovery-results/**
+      - recovered-app.js
+      - recovery-manifest.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Search historical app-part combinations
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'}).trim();
+          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+          function decode(s){s=clean(s); if(!s||!/^[A-Za-z0-9+/]*$/.test(s)||s.length%4===1)return null; return Buffer.from(s+'='.repeat((4-s.length%4)%4),'base64');}
+          const all=[];
+          for(let i=1;i<=8;i++){
+            const file=`app-part-${String(i).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H','--',file]).split(/\s+/).filter(Boolean);
+            const map=new Map();
+            for(const c of commits){
+              let blob; try{blob=sh(['rev-parse',`${c}:${file}`]);}catch{continue}
+              if(map.has(blob))continue;
+              let txt; try{txt=execFileSync('git',['show',`${c}:${file}`],{encoding:'utf8'});}catch{continue}
+              const bytes=decode(txt); if(!bytes)continue;
+              map.set(blob,{blob,commit:c,chars:clean(txt).length,bytes});
+            }
+            all.push([...map.values()]);
+          }
+          const results=[]; let tested=0; const chosen=[];
+          function tryChoice(){
+            tested++;
+            const raw=Buffer.concat(chosen.map(x=>x.bytes));
+            if(raw.length<2||raw[0]!==0x1f||raw[1]!==0x8b)return null;
+            try{const out=zlib.gunzipSync(raw).toString('utf8'); new Function(out); return {raw,out};}catch{return null;}
+          }
+          function rec(i){
+            if(i===8){const r=tryChoice(); if(r) return r; return null;}
+            for(const c of all[i]){chosen.push(c); const r=rec(i+1); if(r)return r; chosen.pop();}
+            return null;
+          }
+          const found=rec(0);
+          let result;
+          if(found){
+            const digest=crypto.createHash('sha256').update(found.out).digest('hex');
+            result={found:true,tested,sourceChars:found.out.length,gzipBytes:found.raw.length,sha256:digest,parts:chosen.map((x,i)=>({part:i+1,blob:x.blob,commit:x.commit,chars:x.chars,bytes:x.bytes.length}))};
+            fs.writeFileSync('recovered-app.js',found.out);
+            fs.writeFileSync('recovery-manifest.json',JSON.stringify(result,null,2));
+          }else{
+            result={found:false,tested,counts:all.map(x=>x.length)};
+            fs.writeFileSync('recovery-manifest.json',JSON.stringify(result,null,2));
+          }
+          fs.mkdirSync('recovery-results',{recursive:true});
+          fs.writeFileSync('recovery-results/latest.json',JSON.stringify(result,null,2)+'\n');
+          console.log(JSON.stringify(result,null,2));
+          NODE
+      - name: Commit recovered source or result
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add recovered-app.js recovery-manifest.json recovery-results/latest.json || true
+          if git diff --cached --quiet; then exit 0; fi
+          if [ -f recovered-app.js ]; then msg='recovery: save recovered application source'; else msg='recovery: save app-part search result'; fi
+          git commit -m "$msg"
+          git push

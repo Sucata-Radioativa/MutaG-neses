@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
@@ -26,99 +27,172 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Scan dangling Git objects for lost application blobs
+      - name: Search previous successful Pages artifacts
+        id: recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_ID: 354312327
         run: |
           set -euo pipefail
-          git fsck --full --unreachable --no-reflogs --no-progress > /tmp/fsck.txt || true
-          echo '=== UNREACHABLE LARGE BLOBS ==='
-          while read -r state type sha; do
-            [ "$state" = unreachable ] || [ "$state" = dangling ] || continue
-            [ "$type" = blob ] || continue
-            size=$(git cat-file -s "$sha" 2>/dev/null || echo 0)
-            if [ "$size" -ge 4000 ]; then
-              echo "$sha size=$size"
-              git cat-file blob "$sha" | head -c 100 | od -An -tx1c || true
-            fi
-          done < /tmp/fsck.txt
-          echo '=== END FSCK ==='
+          rm -rf /tmp/pages-recovery
+          mkdir -p /tmp/pages-recovery
+          python3 <<'PY'
+          import json, os, subprocess, urllib.request, urllib.parse, pathlib, sys, tarfile, zipfile, shutil
 
-      - name: Restore valid historical gzip segments
+          token=os.environ['GH_TOKEN']
+          repo=os.environ['REPO']
+          workflow=os.environ['WORKFLOW_ID']
+          headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10'}
+          base=f'https://api.github.com/repos/{repo}'
+
+          def get(url):
+              r=urllib.request.Request(url,headers=headers)
+              with urllib.request.urlopen(r,timeout=30) as x: return json.load(x)
+
+          runs=[]
+          for page in range(1,6):
+              data=get(f'{base}/actions/workflows/{workflow}/runs?per_page=100&page={page}')
+              runs += [x for x in data.get('workflow_runs',[]) if x.get('conclusion')=='success']
+              if len(data.get('workflow_runs',[]))<100: break
+          runs.sort(key=lambda x:x.get('created_at',''), reverse=True)
+
+          def inspect_tree(root):
+              # direct recovered JS
+              for name in ['app-core.js','app.bundle.js']:
+                  p=root/name
+                  if p.exists() and p.stat().st_size>100000:
+                      txt=p.read_text(errors='ignore')
+                      try:
+                          subprocess.run(['node','--check',str(p)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                          return ('direct',p)
+                      except Exception: pass
+              # segmented gzip application
+              segs=[root/f'app-segment-{i:02d}.txt' for i in range(1,9)]
+              if all(p.exists() for p in segs):
+                  chk=root/'/tmp-placeholder'
+              return None
+
+          import base64, zlib
+          def recover(root):
+              # app-segment: each segment is an independent gzip member containing sequential JS.
+              segs=[]
+              for i in range(1,9):
+                  p=root/f'app-segment-{i:02d}.txt'
+                  if not p.exists(): break
+                  try:
+                      s=''.join(p.read_text(errors='ignore').split()).rstrip('=')
+                      if not s: return None
+                      raw=base64.b64decode(s+'='*((4-len(s)%4)%4),validate=True)
+                      src=zlib.decompress(raw,16+zlib.MAX_WBITS).decode('utf-8')
+                      if not src.strip(): return None
+                      segs.append(src)
+                  except Exception:
+                      segs=[]; break
+              if len(segs)==8:
+                  source=''.join(segs)
+                  try:
+                      out=root/'recovered-app.js'; out.write_text(source)
+                      subprocess.run(['node','--check',str(out)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      if len(source)>100000: return out
+                  except Exception: pass
+
+              # app-part: each part is Base64 for a byte slice of one gzip stream.
+              parts=[]
+              for i in range(1,9):
+                  p=root/f'app-part-{i:02d}.txt'
+                  if not p.exists(): break
+                  try:
+                      s=''.join(p.read_text(errors='ignore').split()).rstrip('=')
+                      raw=base64.b64decode(s+'='*((4-len(s)%4)%4),validate=True)
+                      parts.append(raw)
+                  except Exception:
+                      parts=[]; break
+              if len(parts)==8:
+                  raw=b''.join(parts)
+                  try:
+                      source=zlib.decompress(raw,16+zlib.MAX_WBITS).decode('utf-8')
+                      out=root/'recovered-app.js'; out.write_text(source)
+                      subprocess.run(['node','--check',str(out)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      if len(source)>100000: return out
+                  except Exception: pass
+              return None
+
+          recovered=None
+          manifest=[]
+          for run in runs:
+              rid=run['id']
+              try: arts=get(f'{base}/actions/runs/{rid}/artifacts?per_page=100').get('artifacts',[])
+              except Exception: continue
+              for art in arts:
+                  if art.get('name')!='github-pages' or art.get('expired'): continue
+                  aid=art['id']
+                  zip_path=pathlib.Path('/tmp/pages-recovery')/f'{rid}.zip'
+                  extract=pathlib.Path('/tmp/pages-recovery')/str(rid)
+                  extract.mkdir(parents=True,exist_ok=True)
+                  try:
+                      url=f'{base}/actions/artifacts/{aid}/zip'
+                      req=urllib.request.Request(url,headers=headers)
+                      with urllib.request.urlopen(req,timeout=60) as x, open(zip_path,'wb') as f: shutil.copyfileobj(x,f)
+                      with zipfile.ZipFile(zip_path) as z: z.extractall(extract)
+                      tar=extract/'artifact.tar'
+                      if tar.exists():
+                          site=extract/'site'; site.mkdir(exist_ok=True)
+                          with tarfile.open(tar) as t: t.extractall(site)
+                      else: site=extract
+                      candidate=recover(site)
+                      manifest.append({'run':rid,'run_number':run.get('run_number'),'created_at':run.get('created_at'),'artifact':aid,'candidate':bool(candidate)})
+                      if candidate:
+                          recovered=(candidate,run,art,site)
+                          print('RECOVERED FROM RUN',rid,'#',run.get('run_number'),'created',run.get('created_at'),'artifact',aid)
+                          break
+                  except Exception as e:
+                      manifest.append({'run':rid,'error':str(e)})
+              if recovered: break
+
+          pathlib.Path('/tmp/pages-recovery/search-manifest.json').write_text(json.dumps(manifest,indent=2))
+          if not recovered:
+              print('NO_VALID_HISTORICAL_PAGES_ARTIFACT')
+              sys.exit(2)
+          candidate,run,art,site=recovered
+          target=pathlib.Path('app-core.js')
+          shutil.copyfile(candidate,target)
+          # Recover the matching HTML/CSS/assets from the same published artifact while preserving current cloud-boot.js when present.
+          for name in ['index.html','style.css','auth.css']:
+              src=site/name
+              if src.exists(): shutil.copyfile(src, pathlib.Path(name))
+          # Keep a deterministic recovery manifest in the workspace.
+          meta={'run_id':run['id'],'run_number':run.get('run_number'),'created_at':run.get('created_at'),'artifact_id':art['id'],'source':str(candidate),'source_size':target.stat().st_size}
+          pathlib.Path('recovery-manifest.json').write_text(json.dumps(meta,indent=2))
+          PY
+
+      - name: Configure recovered application entrypoint
+        if: steps.recovery.outcome == 'success'
         run: |
           set -euo pipefail
-          git show 6e54e3535675c2d1714e0fa868e2ebebe54662f2:app-segment-02.txt > app-segment-02.txt
-          git show 6f62e41f5dc96566e614404c6c22562f1d9b35f0:app-segment-03.txt > app-segment-03.txt
-          git show 263e2ec8051f1f82e9b59f0f1f68747358f64572:app-segment-04.txt > app-segment-04.txt
-          git show bf6225a5da1c79cf808b743f6a63e455f9b15968:app-segment-05.txt > app-segment-05.txt
-          git show 4dce965786b73099edce40b7fdf6312fdc60015a:app-segment-06.txt > app-segment-06.txt
-          git show 78d283ff061ba4da5d7b7a59ea624c5f3cfcbaf3:app-segment-07.txt > app-segment-07.txt
-
-      - name: Install gzip recovery toolkit
-        run: |
-          set -euo pipefail
-          curl -fsSL https://raw.githubusercontent.com/arenn/gzrt/master/gzrecover.c -o /tmp/gzrecover.c
-          gcc -O2 -o /tmp/gzrecover /tmp/gzrecover.c -lz
-          /tmp/gzrecover -V
-
-      - name: Decode and recover damaged segments
-        run: |
-          set -euo pipefail
-          node <<'NODE'
-          const fs=require('node:fs');
-          const names=['01','02','03','04','05','06','07','08'];
-          for(const n of names){
-            let s=fs.readFileSync(`app-segment-${n}.txt`,'utf8').replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
-            if(!s || !/^[A-Za-z0-9+/]*$/.test(s) || s.length%4===1) throw new Error(`segment ${n}: invalid base64 length ${s.length}`);
-            s+='='.repeat((4-s.length%4)%4);
-            fs.writeFileSync(`/tmp/seg${n}.gz`,Buffer.from(s,'base64'));
-          }
-          NODE
-
-          /tmp/gzrecover -p -v /tmp/seg01.gz > /tmp/seg01.recovered.js 2> /tmp/seg01.recovery.log || true
-          /tmp/gzrecover -p -v /tmp/seg08.gz > /tmp/seg08.recovered.js 2> /tmp/seg08.recovery.log || true
-
-          node <<'NODE'
-          const fs=require('node:fs');
-          const zlib=require('node:zlib');
-          const vm=require('node:vm');
-          const valid=[];
-          for(let i=2;i<=7;i++) valid.push(zlib.gunzipSync(fs.readFileSync(`/tmp/seg${String(i).padStart(2,'0')}.gz`)).toString('utf8'));
-          const r1=fs.readFileSync('/tmp/seg01.recovered.js','utf8');
-          const r8=fs.readFileSync('/tmp/seg08.recovered.js','utf8');
-          console.log(`recovered seg01=${r1.length} seg08=${r8.length}`);
-          console.log('--- seg01 recovery log ---');
-          console.log(fs.readFileSync('/tmp/seg01.recovery.log','utf8'));
-          console.log('--- seg08 recovery log ---');
-          console.log(fs.readFileSync('/tmp/seg08.recovery.log','utf8'));
-          const full=r1+valid.join('')+r8;
-          try{
-            new vm.Script(full,{filename:'mutageneses-recovered.js'});
-            fs.writeFileSync('app-core.js',full,'utf8');
-            console.log(`PASS NATURAL RECOVERY: ${full.length} chars`);
-          }catch(e){
-            console.log(`Natural reconstruction parse: ${e.message}`);
-            fs.writeFileSync('recovery-seg01.js',r1,'utf8');
-            fs.writeFileSync('recovery-seg08.js',r8,'utf8');
-            process.exit(2);
-          }
-          NODE
-
-      - name: Verify recovered app
-        run: |
-          set -euo pipefail
-          node --check app-core.js
-          test "$(wc -c < app-core.js)" -gt 100000
-          echo "PASS: recovered application source is syntactically valid"
-
-      - name: Install direct application loader
-        run: |
           python3 - <<'PY'
           from pathlib import Path
           p=Path('index.html')
           s=p.read_text()
-          s=s.replace('<script src="app.js"></script>','<script src="app-core.js"></script>\n  <script src="cloud-boot.js"></script>')
+          # Remove old loaders and use the recovered uncompressed source directly.
+          import re
+          s=re.sub(r'\s*<script\s+src=["\']app\.js[^>]*></script>','',s)
+          s=re.sub(r'\s*<script\s+src=["\']cloud-boot\.js[^>]*></script>','',s)
+          marker='  <script src="app-core.js"></script>\n'
+          if 'app-core.js' not in s:
+              s=s.replace('</body>',marker+'</body>')
           p.write_text(s)
-          Path('app.js').write_text('// Compatibility placeholder; index.html loads app-core.js directly.\n')
+          Path('app.js').write_text('// MUTAGENÊSES: recovered application is loaded directly from app-core.js.\n')
           PY
+
+      - name: Validate recovered application
+        run: |
+          set -euo pipefail
+          test -s app-core.js
+          node --check app-core.js
+          test "$(wc -c < app-core.js)" -gt 100000
+          echo "PASS: recovered application source is syntactically valid"
+          test -s index.html
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5

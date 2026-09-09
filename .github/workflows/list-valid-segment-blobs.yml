@@ -1,0 +1,40 @@
+name: List valid segment blobs
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Test historical segment blobs
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const zlib=require('node:zlib');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'}).trim();
+          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+          for(let n=1;n<=8;n++){
+            const file=`app-segment-${String(n).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H','--',file]).split(/\s+/).filter(Boolean);
+            const seen=new Map();
+            for(const c of commits){
+              try{
+                const blob=sh(['rev-parse',`${c}:${file}`]);
+                if(seen.has(blob))continue;
+                const text=clean(sh(['show',`${c}:${file}`]));
+                let raw;try{raw=Buffer.from(text,'base64')}catch{continue}
+                if(raw.length<18||raw[0]!==0x1f||raw[1]!==0x8b)continue;
+                try{const src=zlib.gunzipSync(raw).toString('utf8');seen.set(blob,{c,text,src,raw});}catch{}
+              }catch{}
+            }
+            console.log(`SEGMENT ${n}: ${seen.size} VALID BLOBS`);
+            for(const [blob,x] of seen) console.log(`  blob=${blob} commit=${x.c} b64=${x.text.length} gzip=${x.raw.length} js=${x.src.length}`);
+          }
+          NODE

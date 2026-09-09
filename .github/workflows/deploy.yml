@@ -26,49 +26,83 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore exact original application parts
+      - name: Recover application from historical app-part blobs
         run: |
           set -euo pipefail
-          git show 6900339e3fa41fc06f46567da2b9e2963b8b6507:app-part-01.txt > app-part-01.txt
-          git show f9990d52817b0e0cae2f1b534b94bc5ef15a95a6:app-part-02.txt > app-part-02.txt
-          git show c7ccd9e2cd2349b99f0fbc905b276d84f9f39996:app-part-03.txt > app-part-03.txt
-          git show 457db1ea7d82199ed73d68ac5ff536995fff8aee:app-part-04.txt > app-part-04.txt
-          git show 24934ad901f2a8536e85ab005f695e0f8ac7bc76:app-part-05.txt > app-part-05.txt
-          git show 99036256a9277a798f05c5f1f25b074848448148:app-part-06.txt > app-part-06.txt
-          git show 54467ebfe0efec6588f6faa63f60f25f0d565a08:app-part-07.txt > app-part-07.txt
-          git show e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1:app-part-08.txt > app-part-08.txt
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const zlib=require('node:zlib');
+          const vm=require('node:vm');
+          const fs=require('node:fs');
+          const crypto=require('node:crypto');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'}).trim();
+          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/');
+          function decode(s){s=clean(s);if(!s||!/^[A-Za-z0-9+/]*={0,2}$/.test(s)||s.length%4===1)return null;if(s.length%4)s+='='.repeat(4-s.length%4);return Buffer.from(s,'base64');}
+          const candidates=[];
+          for(let i=1;i<=8;i++){
+            const file=`app-part-${String(i).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H','--',file]).split(/\s+/).filter(Boolean);
+            const map=new Map();
+            for(const c of commits){
+              try{
+                const blob=sh(['rev-parse',`${c}:${file}`]);
+                if(map.has(blob)) continue;
+                const text=execFileSync('git',['show',`${c}:${file}`],{encoding:'utf8'});
+                const bytes=decode(text); if(bytes) map.set(blob,{blob,commit:c,bytes,chars:clean(text).length});
+              }catch{}
+            }
+            candidates.push([...map.values()]);
+            console.log(`part${i} candidates=${map.size}`);
+          }
+          const chosen=[]; let tested=0,found=null;
+          function rec(i){
+            if(found)return;
+            if(i===8){
+              tested++;
+              const raw=Buffer.concat(chosen.map(x=>x.bytes));
+              if(raw.length<2||raw[0]!==0x1f||raw[1]!==0x8b)return;
+              try{
+                const source=zlib.gunzipSync(raw).toString('utf8');
+                new vm.Script(source,{filename:'mutageneses-app.js'});
+                found={source,raw,parts:chosen.map((x,j)=>({part:j+1,blob:x.blob,commit:x.commit,chars:x.chars,bytes:x.bytes.length}))};
+              }catch{}
+              return;
+            }
+            for(const c of candidates[i]){chosen.push(c);rec(i+1);chosen.pop();if(found)return;}
+          }
+          rec(0);
+          console.log(`combinations=${tested}`);
+          if(!found) throw new Error('Nenhuma combinação histórica de app-part produziu um GZIP/JavaScript válido.');
+          const sha=crypto.createHash('sha256').update(found.source).digest('hex');
+          console.log(`RECOVERED JS chars=${found.source.length} gzip=${found.raw.length} sha256=${sha}`);
+          console.log(JSON.stringify(found.parts,null,2));
+          fs.writeFileSync('app-core.js',found.source,'utf8');
+          NODE
 
-      - name: Validate application payload
+      - name: Validate recovered application
         run: |
           node <<'NODE'
-          const fs = require('node:fs');
-          const zlib = require('node:zlib');
-          const vm = require('node:vm');
-
-          const files = Array.from({length: 8}, (_, i) =>
-            `app-part-${String(i + 1).padStart(2, '0')}.txt`
-          );
-          const b64 = files.map(f => fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, '').replace(/[\s\u200B\u200C\u200D]/g, '')).join('');
-
-          if (!b64 || b64.length % 4 === 1) {
-            throw new Error(`Base64 final inválido: comprimento=${b64.length}`);
-          }
-
-          const raw = Buffer.from(b64, 'base64');
-          if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) {
-            throw new Error(`GZIP inválido: assinatura=${raw.subarray(0, 4).toString('hex')}`);
-          }
-
-          const source = zlib.gunzipSync(raw).toString('utf8');
-          if (!source.trim()) throw new Error('Aplicação vazia.');
-          new vm.Script(source, {filename: 'mutageneses-app.js'});
-          console.log(`PASS: payload original íntegro; ${b64.length} Base64 chars; ${raw.length} gzip bytes; ${source.length} JS chars.`);
+          const fs=require('node:fs');
+          const vm=require('node:vm');
+          const code=fs.readFileSync('app-core.js','utf8');
+          if(code.length<100000) throw new Error(`app-core.js suspeito: ${code.length} chars`);
+          new vm.Script(code,{filename:'app-core.js'});
+          console.log(`PASS: app-core.js ${code.length} chars`);
           NODE
+
+      - name: Install recovered application loader
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('index.html')
+          s=p.read_text()
+          s=s.replace('<script src="app.js"></script>','<script src="app-core.js"></script>\n  <script src="cloud-boot.js"></script>')
+          p.write_text(s)
+          Path('app.js').write_text('// Legacy loader retained for compatibility; application is loaded directly by index.html.\n')
+          PY
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - name: Upload site
         uses: actions/upload-pages-artifact@v4

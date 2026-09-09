@@ -1,0 +1,87 @@
+name: Recover damaged deflate members
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Build zlib recovery mode
+        run: |
+          set -euo pipefail
+          curl -fsSL https://zlib.net/zlib-1.3.1.tar.gz -o /tmp/zlib.tar.gz
+          tar -xzf /tmp/zlib.tar.gz -C /tmp
+          cd /tmp/zlib-1.3.1
+          CFLAGS='-O2 -DINFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR' ./configure --static >/tmp/zlib-config.log
+          make -j2 >/tmp/zlib-make.log
+          cat > /tmp/recover_gz.c <<'C'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <zlib.h>
+          int main(int argc,char**argv){
+            if(argc!=3){fprintf(stderr,"usage: recover_gz in.gz out\n");return 2;}
+            gzFile in=gzopen(argv[1],"rb"); if(!in){perror("gzopen");return 2;}
+            FILE*out=fopen(argv[2],"wb"); if(!out){perror("fopen");return 2;}
+            unsigned char buf[65536]; int n,total=0;
+            while((n=gzread(in,buf,sizeof(buf)))>0){ if(fwrite(buf,1,n,out)!=(size_t)n)return 3; total+=n; }
+            int err=0; const char*msg=gzerror(in,&err); fprintf(stderr,"gzread done total=%d err=%d msg=%s\n",total,err,msg?msg:"");
+            gzclose(in); fclose(out); return 0;
+          }
+          gcc -O2 /tmp/recover_gz.c -I. /tmp/zlib-1.3.1/libz.a -o /tmp/recover_gz
+
+      - name: Prepare damaged members
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs=require('node:fs');
+          const {execFileSync}=require('node:child_process');
+          const b64=s=>{s=String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,''); if(s.length%4===1)throw new Error('bad base64 '+s.length); s+='='.repeat((4-s.length%4)%4); return Buffer.from(s,'base64')};
+          fs.writeFileSync('/tmp/seg01.gz',b64(fs.readFileSync('app-segment-01.txt','utf8')));
+          fs.writeFileSync('/tmp/seg08.gz',b64(fs.readFileSync('app-segment-08.txt','utf8')));
+          const s5=execFileSync('git',['show','78f0a68ae9:app-segment-05.txt'],{encoding:'utf8'}); fs.writeFileSync('/tmp/seg05.gz',b64(s5));
+          NODE
+          for n in 01 05 08; do ls -l /tmp/seg$n.gz; done
+
+      - name: Recover corrupted streams
+        run: |
+          set +e
+          /tmp/recover_gz /tmp/seg01.gz recovered-seg01.js
+          e1=$?
+          /tmp/recover_gz /tmp/seg05.gz recovered-seg05.js
+          e5=$?
+          /tmp/recover_gz /tmp/seg08.gz recovered-seg08.js
+          e8=$?
+          set -e
+          echo "recover exit codes: seg01=$e1 seg05=$e5 seg08=$e8"
+          ls -l recovered-seg*.js
+
+      - name: Analyze recovered output
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs=require('node:fs');
+          for(const n of ['01','05','08']){
+            const p=`recovered-seg${n}.js`; const s=fs.readFileSync(p,'utf8'); const nul=(s.match(/\0/g)||[]).length;
+            try{new Function(s);console.log(`seg${n}: SYNTAX PASS chars=${s.length} nul=${nul}`)}catch(e){console.log(`seg${n}: syntax FAIL chars=${s.length} nul=${nul} error=${e.message}`)}
+            console.log(`seg${n}: head=${JSON.stringify(s.slice(0,180))}`);
+          }
+          NODE
+
+      - name: Persist recovery artifacts
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add recovered-seg*.js
+          git diff --cached --quiet && exit 0 || true
+          git commit -m 'recovery: save zlib-salvaged application segments'
+          git push origin recovery/diagnose-segments

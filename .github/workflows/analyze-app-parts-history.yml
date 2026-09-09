@@ -1,0 +1,82 @@
+name: Analyze app-part history
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Enumerate historical app-part blobs and recover prefixes
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const fs=require('node:fs');
+          const sh=args=>execFileSync('git',args,{encoding:'utf8'}).trim();
+          const clean=s=>String(s??'').replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+          const all=[];
+          for(let n=1;n<=8;n++){
+            const file=`app-part-${String(n).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H|%ad|%s','--date=iso-strict','--',file]).split('\n').filter(Boolean);
+            const map=new Map();
+            for(const row of commits){
+              const [sha,date,...msg]=row.split('|');
+              try{
+                const blob=sh(['rev-parse',`${sha}:${file}`]);
+                const text=clean(sh(['show',`${sha}:${file}`]));
+                if(/^[A-Za-z0-9+/]+$/.test(text) && !map.has(blob)) map.set(blob,{blob,sha,date,msg:msg.join('|'),text});
+              }catch{}
+            }
+            all.push([...map.values()]);
+            console.log(`part ${n}: ${map.size} unique blobs`);
+            for(const c of map.values()) console.log(`  blob=${c.blob} chars=${c.text.length} commit=${c.sha} date=${c.date} msg=${c.msg}`);
+          }
+
+          // For each candidate fragment, measure how far the resulting merged stream can inflate.
+          // We rank each fragment by prefix usefulness without assuming it is independently valid.
+          const best=[];
+          for(let n=0;n<all.length;n++){
+            let bestItem=null;
+            for(const c of all[n]){
+              // Reconstruct a stream using this candidate plus current parts for all other positions.
+              const texts=[];
+              for(let j=0;j<8;j++) texts.push(j===n?c.text:all[j][0].text);
+              let merged=texts.join('');
+              if(merged.length%4===1) merged=merged.slice(0,-1); // only for prefix measurement
+              if(merged.length%4) merged+='='.repeat(4-merged.length%4);
+              let raw;try{raw=Buffer.from(merged,'base64')}catch{continue}
+              const d=zlib.createGunzip();let produced=0,err=null;
+              d.on('data',b=>produced+=b.length);d.on('error',e=>err=e);
+              try{d.end(raw)}catch(e){err=e}
+              // sync-ish fallback: one-shot catches complete stream only
+              try{produced=Math.max(produced,zlib.gunzipSync(raw).length)}catch{}
+              const score=produced;
+              if(!bestItem||score>bestItem.score)bestItem={score,c};
+            }
+            best.push(bestItem);
+            if(bestItem)console.log(`BEST PART ${n+1}: produced=${bestItem.score} blob=${bestItem.c.blob}`);
+          }
+
+          // Export the complete candidate inventory for offline analysis.
+          fs.writeFileSync('app-part-history.json',JSON.stringify(all.map(list=>list.map(c=>({blob:c.blob,commit:c.sha,date:c.date,msg:c.msg,text:c.text}))),null,2));
+          console.log('inventory written');
+          NODE
+
+      - name: Upload app-part history inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-part-history
+          path: app-part-history.json
+          retention-days: 7

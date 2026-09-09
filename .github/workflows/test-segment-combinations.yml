@@ -1,0 +1,96 @@
+name: Test segment combinations
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Find valid segmented bundle
+        run: |
+          node <<'NODE'
+          const {execFileSync} = require('node:child_process');
+          const zlib = require('node:zlib');
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+
+          function sh(args){return execFileSync('git',args,{encoding:'utf8'}).trim();}
+          function clean(s){return String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');}
+          function decode(text){
+            let s=clean(text);
+            if(!s || !/^[A-Za-z0-9+/]*$/.test(s) || s.length%4===1) return null;
+            if(s.length%4) s+='='.repeat(4-s.length%4);
+            try{return Buffer.from(s,'base64');}catch{return null;}
+          }
+
+          const candidates=[];
+          for(let n=1;n<=8;n++){
+            const file=`app-segment-${String(n).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H','--',file]).split(/\s+/).filter(Boolean);
+            const byBlob=new Map();
+            for(const commit of commits){
+              let blob;
+              try{blob=sh(['rev-parse',`${commit}:${file}`]);}catch{continue;}
+              if(byBlob.has(blob)) continue;
+              let text;
+              try{text=clean(execFileSync('git',['show',`${commit}:${file}`],{encoding:'utf8'}));}catch{continue;}
+              if(!text || !/^[A-Za-z0-9+/]*$/.test(text)) continue;
+              byBlob.set(blob,{blob,commit,text});
+            }
+            candidates.push([...byBlob.values()]);
+            console.log(`segment ${n}: ${candidates[n-1].length} unique blobs`);
+          }
+
+          const decoded=candidates.map((list,i)=>list.map(c=>{
+            const raw=decode(c.text);
+            if(!raw || raw.length<2 || raw[0]!==0x1f || raw[1]!==0x8b) return null;
+            try{
+              const source=zlib.gunzipSync(raw).toString('utf8');
+              return {...c,raw,source};
+            }catch{return null;}
+          }).filter(Boolean));
+
+          decoded.forEach((list,i)=>console.log(`segment ${i+1}: ${list.length} standalone-valid candidates`));
+          if(decoded.some(x=>x.length===0)) throw new Error('Um segmento não possui nenhuma cópia GZIP válida.');
+
+          let tested=0, found=null;
+          const chosen=[];
+          function rec(i){
+            if(found) return;
+            if(i===8){
+              tested++;
+              const source=chosen.map(x=>x.source).join('');
+              try{
+                new Function(source);
+                found={chosen:[...chosen],source};
+              }catch{}
+              return;
+            }
+            for(const c of decoded[i]){
+              chosen.push(c);
+              rec(i+1);
+              chosen.pop();
+              if(found) return;
+            }
+          }
+          rec(0);
+          console.log(`Combinations tested: ${tested}`);
+
+          if(!found) throw new Error('Nenhuma combinação dos segmentos GZIP históricos forma JavaScript válido.');
+
+          console.log('FOUND:');
+          found.chosen.forEach((x,i)=>console.log(`segment ${i+1}: blob=${x.blob} commit=${x.commit} gzip=${x.raw.length} source=${x.source.length}`));
+          const digest=crypto.createHash('sha256').update(found.source).digest('hex');
+          console.log(`Recovered JS: ${found.source.length} chars; SHA256=${digest}`);
+          fs.writeFileSync('recovered-segmented-app.js',found.source,'utf8');
+          fs.writeFileSync('recovery-manifest.json',JSON.stringify(found.chosen.map((x,i)=>({segment:i+1,blob:x.blob,commit:x.commit})),null,2));
+          NODE

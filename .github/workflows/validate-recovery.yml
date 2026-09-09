@@ -1,0 +1,69 @@
+name: Validate recovery payload
+
+on:
+  push:
+    branches: [recovery/verified-app-parts]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test payload formats
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const zlib = require('node:zlib');
+
+          function clean(s) {
+            return String(s).replace(/^\uFEFF/, '').replace(/[\s\u200B\u200C\u200D]/g, '').replace(/-/g, '+').replace(/_/g, '/').replace(/=/g, '');
+          }
+          function decode(s) {
+            s = clean(s);
+            if (s.length % 4 === 1) return null;
+            if (s.length % 4) s += '='.repeat(4 - s.length % 4);
+            return Buffer.from(s, 'base64');
+          }
+          function testSet(prefix) {
+            const files = Array.from({length: 8}, (_,i) => `${prefix}-${String(i+1).padStart(2,'0')}.txt`);
+            const text = files.map(f => clean(fs.readFileSync(f, 'utf8')));
+            console.log(`${prefix}: sizes=${text.map(x=>x.length).join(',')} total=${text.join('').length}`);
+
+            let merged = text.join('');
+            if (merged.length % 4 !== 1) {
+              try {
+                const padded = merged + '='.repeat((4 - merged.length % 4) % 4);
+                const raw = Buffer.from(padded, 'base64');
+                console.log(`${prefix} merged: decoded=${raw.length} signature=${raw.subarray(0,4).toString('hex')}`);
+                try {
+                  const out = zlib.gunzipSync(raw);
+                  console.log(`${prefix} merged GZIP: PASS output=${out.length}`);
+                  return {ok:true, mode:'merged', raw, out};
+                } catch (e) { console.log(`${prefix} merged GZIP: FAIL ${e.message}`); }
+              } catch (e) { console.log(`${prefix} merged decode: FAIL ${e.message}`); }
+            }
+
+            const decoded = text.map(decode);
+            if (decoded.every(Boolean)) {
+              const raw = Buffer.concat(decoded);
+              console.log(`${prefix} per-part: decoded=${raw.length} signature=${raw.subarray(0,4).toString('hex')}`);
+              try {
+                const out = zlib.gunzipSync(raw);
+                console.log(`${prefix} per-part GZIP: PASS output=${out.length}`);
+                return {ok:true, mode:'per-part', raw, out};
+              } catch (e) { console.log(`${prefix} per-part GZIP: FAIL ${e.message}`); }
+            } else {
+              console.log(`${prefix} per-part: at least one fragment has invalid standalone Base64 length`);
+            }
+            return {ok:false};
+          }
+
+          let any = false;
+          any ||= testSet('app-part').ok;
+          any ||= testSet('app-segment').ok;
+          if (!any) process.exitCode = 1;
+          NODE

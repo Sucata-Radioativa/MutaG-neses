@@ -8,4 +8,8 @@ O site é publicado automaticamente no GitHub Pages pela branch `main` usando Gi
 
 ## Estado atual
 
-A publicação está usando o fluxo simples de GitHub Pages enquanto o empacotamento experimental do aplicativo é corrigido separadamente. Isso evita que um bundle Base64/GZIP inválido impeça o deploy do site.
+A publicação usa o conteúdo atual da branch `main`. O carregamento da aplicação reconstrói os oito fragmentos Base64 como um único fluxo GZIP antes de executar o aplicativo.
+
+## Deploy
+
+Correção de publicação aplicada para garantir que o GitHub Pages use o `index.html` e o carregador `app.js` da mesma versão.

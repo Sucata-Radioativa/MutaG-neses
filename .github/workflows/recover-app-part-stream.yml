@@ -1,0 +1,63 @@
+name: Recover full app-part stream
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Rebuild historical byte stream
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const src={
+            1:['9e3e9f6dadd1b7024dcd78ffc75da35da6a50165','app-part-01.txt'],
+            2:['f9990d52817b0e0cae2f1b534b94bc5ef15a95a6','app-part-02.txt'],
+            3:['c7ccd9e2cd2349b99f0fbc905b276d84f9f39996','app-part-03.txt'],
+            4:['457db1ea7d82199ed73d68ac5ff536995fff8aee','app-part-04.txt'],
+            5:['24934ad901f2a8536e85ab005f695e0f8ac7bc76','app-part-05.txt'],
+            6:['99036256a9277a798f05c5f1f25b074848448148','app-part-06.txt'],
+            7:['54467ebfe0efec6588f6faa63f60f25f0d565a08','app-part-07.txt'],
+            8:['e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1','app-part-08.txt']};
+          const b64=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'').trim();
+          const chunks=[];
+          for(let i=1;i<=8;i++){
+            const [c,f]=src[i];
+            const s=b64(execFileSync('git',['show',`${c}:${f}`],{encoding:'utf8'}));
+            if(s.length%4===1) throw new Error(`part${i} base64 length=${s.length} impossible`);
+            const bytes=Buffer.from(s+'='.repeat((4-s.length%4)%4),'base64');
+            console.log(`part${i} chars=${s.length} bytes=${bytes.length} head=${bytes.subarray(0,4).toString('hex')}`);
+            chunks.push(bytes);
+          }
+          const raw=Buffer.concat(chunks);
+          fs.writeFileSync('historical-app-part.raw',raw);
+          console.log(`RAW ${raw.length} bytes head=${raw.subarray(0,10).toString('hex')} tail=${raw.subarray(-10).toString('hex')}`);
+          // Decompress the raw DEFLATE body without enforcing the (known-corrupt) gzip trailer.
+          const d=zlib.createInflateRaw(); const bufs=[]; d.on('data',b=>bufs.push(b));
+          d.on('error',e=>{console.log('INFLATE ERROR',e.message);});
+          d.on('end',()=>{
+            const out=Buffer.concat(bufs); fs.writeFileSync('historical-app-part-output.js',out);
+            console.log(`OUTPUT ${out.length} bytes sha256=${crypto.createHash('sha256').update(out).digest('hex')}`);
+          });
+          d.end(raw.subarray(10,-8));
+          setTimeout(()=>{},100);
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: historical-app-part-recovery
+          path: |
+            historical-app-part.raw
+            historical-app-part-output.js

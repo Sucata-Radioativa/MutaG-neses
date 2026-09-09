@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Reconstruct application from all known backups
+      - name: Recover damaged gzip members from backups
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -24,47 +24,48 @@ jobs:
           const crypto=require('node:crypto');
           const {execFileSync}=require('node:child_process');
           const sh=a=>execFileSync('git',a,{encoding:'utf8'}).trim();
-          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
-          function decodeB64(s){s=clean(s);if(!s||!/^[A-Za-z0-9+/]*$/.test(s)||s.length%4===1)return null;s+='='.repeat((4-s.length%4)%4);try{return Buffer.from(s,'base64')}catch{return null}}
-          function standalone(name,text){const raw=decodeB64(text);if(!raw||raw[0]!==0x1f||raw[1]!==0x8b)return null;try{return {name,raw,source:zlib.gunzipSync(raw).toString('utf8')}}catch{return null}}
-          function fromFile(name,path,arr){const x=standalone(name,fs.readFileSync(path,'utf8'));console.log(`${name}: ${x?'VALID '+x.raw.length+' bytes':'invalid'}`);if(x)arr.push(x)}
-          function fromHist(name,commit,file,arr){try{const x=standalone(name,sh(['show',`${commit}:${file}`]));console.log(`${name}: ${x?'VALID '+x.raw.length+' bytes':'invalid'}`);if(x)arr.push(x)}catch{console.log(`${name}: missing`)}}
-          const cand={1:[],5:[],8:[]};
-          fromFile('seg01-current','app-segment-01.txt',cand[1]);
-          if(fs.existsSync('_rebuild/seg01-01.txt')){
-            const joined=[1,2,3,4,5].map(i=>fs.readFileSync(`_rebuild/seg01-0${i}.txt`,'utf8')).join('');
-            const x=standalone('seg01-rebuild-joined',joined);console.log('seg01-rebuild-joined:',x?'VALID '+x.raw.length+' bytes':'invalid');if(x)cand[1].push(x);
+          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/');
+          const read=(p)=>fs.readFileSync(p,'utf8');
+          function test(name,b64){
+            let s=clean(b64); if(!s||!/^[A-Za-z0-9+/]*$/.test(s)||s.length%4===1)return null;
+            s+='='.repeat((4-s.length%4)%4);
+            const raw=Buffer.from(s,'base64'); if(raw[0]!==0x1f||raw[1]!==0x8b)return null;
+            try{return {name,raw,source:zlib.gunzipSync(raw).toString('utf8')}}catch{return null}
           }
-          if(fs.existsSync('_pristine/seg01-1.txt')){
-            const joined=['seg01-1.txt','seg01-2.txt','seg01-3.txt'].map(f=>fs.readFileSync(`_pristine/${f}`,'utf8')).join('');
-            const x=standalone('seg01-pristine-joined',joined);console.log('seg01-pristine-joined:',x?'VALID '+x.raw.length+' bytes':'invalid');if(x)cand[1].push(x);
+          function candidateList(seg){
+            const out=[]; const add=(name,s)=>{const x=test(name,s);console.log(`${name}: ${x?'VALID '+x.raw.length+' bytes':'invalid'} chars=${clean(s).length}`);if(x)out.push(x)};
+            const f=`app-segment-${String(seg).padStart(2,'0')}.txt`;
+            add(`seg${seg}-current`,read(f));
+            if(seg===1){
+              const r=[1,2,3,4,5].map(i=>read(`_rebuild/seg01-0${i}.txt`)).join(''); add('seg1-rebuild',r);
+              const p=['seg01-1.txt','seg01-2.txt','seg01-3.txt'].map(x=>read(`_pristine/${x}`)).join(''); add('seg1-pristine',p);
+              for(const [c,file] of [['c642dd6aec',f],['296e8935b3',f]]){try{add(`seg1-hist-${c}`,sh(['show',`${c}:${file}`]))}catch{}}
+            }
+            if(seg===5){
+              const p=['seg05-1.txt','seg05-2.txt','seg05-3.txt'].map(x=>read(`_pristine/${x}`)).join(''); add('seg5-pristine',p);
+              for(const [c,file] of [['bf6225a5da',f],['e37ff1a816',f],['78f0a68ae9',f]]){try{add(`seg5-hist-${c}`,sh(['show',`${c}:${file}`]))}catch{}}
+            }
+            if(seg===8){
+              const p=['seg08-1.txt','seg08-2.txt','seg08-3.txt'].map(x=>read(`_pristine/${x}`)).join(''); add('seg8-pristine',p);
+              for(const [c,file] of [['bae3b97235',f],['750a71ece8',f]]){try{add(`seg8-hist-${c}`,sh(['show',`${c}:${file}`]))}catch{}}
+            }
+            return out;
           }
-          for(const [c,file] of [['c642dd6aec','app-segment-01.txt'],['296e8935b3','app-segment-01.txt']])fromHist(`seg01-${c}`,c,file,cand[1]);
-          fromFile('seg05-current','app-segment-05.txt',cand[5]);
-          if(fs.existsSync('_pristine/seg05-1.txt')){
-            const joined=['seg05-1.txt','seg05-2.txt','seg05-3.txt'].map(f=>fs.readFileSync(`_pristine/${f}`,'utf8')).join('');
-            const x=standalone('seg05-pristine-joined',joined);console.log('seg05-pristine-joined:',x?'VALID '+x.raw.length+' bytes':'invalid');if(x)cand[5].push(x);
-          }
-          for(const [c,file] of [['bf6225a5da','app-segment-05.txt'],['e37ff1a816','app-segment-05.txt'],['78f0a68ae9','app-segment-05.txt']])fromHist(`seg05-${c}`,c,file,cand[5]);
-          fromFile('seg08-current','app-segment-08.txt',cand[8]);
-          if(fs.existsSync('_pristine/seg08-1.txt')){
-            const joined=['seg08-1.txt','seg08-2.txt','seg08-3.txt'].map(f=>fs.readFileSync(`_pristine/${f}`,'utf8')).join('');
-            const x=standalone('seg08-pristine-joined',joined);console.log('seg08-pristine-joined:',x?'VALID '+x.raw.length+' bytes':'invalid');if(x)cand[8].push(x);
-          }
-          for(const [c,file] of [['bae3b97235','app-segment-08.txt'],['750a71ece8','app-segment-08.txt']])fromHist(`seg08-${c}`,c,file,cand[8]);
-          const fixed={};
-          for(let i=2;i<=7;i++){const x=standalone(`seg${i}`,fs.readFileSync(`app-segment-${String(i).padStart(2,'0')}.txt`,'utf8'));if(!x)throw new Error(`segment ${i} invalid`);fixed[i]=x;}
+
+          const cand={1:candidateList(1),5:candidateList(5),8:candidateList(8)};
+          const fixed={}; for(let i=2;i<=7;i++){const x=test(`seg${i}`,read(`app-segment-${String(i).padStart(2,'0')}.txt`));if(!x)throw new Error(`segment ${i} is invalid`);fixed[i]=x;}
+          console.log(`Candidates valid: 1=${cand[1].length} 5=${cand[5].length} 8=${cand[8].length}`);
           let found=null;
           for(const a of cand[1])for(const e of cand[5])for(const h of cand[8]){
             const source=[a.source,fixed[2].source,fixed[3].source,fixed[4].source,e.source,fixed[6].source,fixed[7].source,h.source].join('');
-            try{new Function(source);found={a,e,h,source};}catch{}
+            try{new Function(source); found={a,e,h,source}; break}catch{}
           }
-          if(!found)throw new Error('Nenhuma combinação de backups produziu JavaScript válido.');
+          if(!found)throw new Error('Nenhuma combinação de reconstruções conhecidas produziu JavaScript válido.');
           const sha=crypto.createHash('sha256').update(found.source).digest('hex');
-          console.log(`FOUND JS ${found.source.length} chars SHA256=${sha}`);
-          console.log(found.a.name,found.e.name,found.h.name);
-          fs.writeFileSync('app-core.js',found.source,'utf8');
-          fs.writeFileSync('recovery-manifest.json',JSON.stringify({sha256:sha,segments:{1:found.a.name,5:found.e.name,8:found.h.name}},null,2));
+          console.log(`FOUND ${found.source.length} chars SHA256=${sha}`);
+          console.log(JSON.stringify({seg1:found.a.name,seg5:found.e.name,seg8:found.h.name},null,2));
+          fs.writeFileSync('app-core.js',found.source);
+          fs.writeFileSync('recovery-manifest.json',JSON.stringify({sha256:sha,seg1:found.a.name,seg5:found.e.name,seg8:found.h.name},null,2));
           NODE
           node --check app-core.js
           git config user.name 'github-actions[bot]'

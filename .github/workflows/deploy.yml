@@ -23,6 +23,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+      - name: Verify application bundle
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const zlib = require('node:zlib');
+          const vm = require('node:vm');
+          const files = Array.from({length:8}, (_,i)=>`app-segment-${String(i+1).padStart(2,'0')}.txt`);
+          const parts = files.map(f => fs.readFileSync(f,'utf8').replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,''));
+          if(parts.some(s => !s || !/^[A-Za-z0-9+/]*$/.test(s))) throw new Error('Segmento Base64 inválido');
+          const b64 = parts.join('');
+          if(b64.length % 4 === 1) throw new Error(`Fluxo Base64 inválido: comprimento ${b64.length}`);
+          const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+          const raw = Buffer.from(padded, 'base64');
+          if(raw[0] !== 0x1f || raw[1] !== 0x8b) throw new Error('GZIP inválido');
+          const source = zlib.gunzipSync(raw).toString('utf8');
+          if(!source.trim()) throw new Error('Aplicação vazia');
+          new vm.Script(source, {filename:'mutageneses-app-bundle.js'});
+          console.log(`PASS: bundle íntegro; ${source.length} caracteres; ${b64.length} caracteres Base64.`);
+          NODE
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:

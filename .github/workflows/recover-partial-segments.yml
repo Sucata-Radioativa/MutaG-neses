@@ -1,0 +1,50 @@
+name: Recover partial segments
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Recover longest partial outputs
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'}).trim();
+          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+          fs.mkdirSync('partial-recovery',{recursive:true});
+          for(let n of [1,5,8]){
+            const file=`app-segment-${String(n).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H','--',file]).split(/\s+/).filter(Boolean);
+            const seen=new Set(), results=[];
+            for(const commit of commits){
+              let blob,text;try{blob=sh(['rev-parse',`${commit}:${file}`]);text=clean(execFileSync('git',['show',`${commit}:${file}`],{encoding:'utf8'}));}catch{continue}
+              if(seen.has(blob)||!/^[A-Za-z0-9+/]+$/.test(text))continue;seen.add(blob);
+              let raw;try{if(text.length%4===1)continue;raw=Buffer.from(text+'='.repeat((4-text.length%4)%4),'base64');}catch{continue}
+              if(raw[0]!==0x1f||raw[1]!==0x8b)continue;
+              const d=zlib.createGunzip();let out=[];let consumed=0;let err='';
+              try{for(let i=0;i<raw.length;i+=64){out.push(d.write(raw.subarray(i,i+64)));consumed=Math.min(raw.length,i+64);if(d.closed)break;}out.push(d.flush());}catch(e){err=e.message}
+              const bytes=Buffer.concat(out.filter(Boolean));
+              results.push({blob,commit,len:text.length,gzip:raw.length,partial:bytes.length,err,sha256:crypto.createHash('sha256').update(bytes).digest('hex')});
+              const path=`partial-recovery/seg${n}-${bytes.length}-${blob}.js`;fs.writeFileSync(path,bytes);
+            }
+            results.sort((a,b)=>b.partial-a.partial);
+            fs.writeFileSync(`partial-recovery/seg${n}-rank.json`,JSON.stringify(results,null,2));
+            console.log(`SEG ${n}`);results.forEach(x=>console.log(JSON.stringify(x)));
+          }
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: partial-segment-recovery
+          path: partial-recovery/
+          retention-days: 7

@@ -23,6 +23,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # Three application segments were accidentally damaged during the earlier
+      # online migration.  Restore the immutable pristine copies from the last
+      # known-good commit before validating and publishing the bundle.
+      - name: Restore pristine application segments
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/Sucata-Radioativa/MutaG-neses/4031a956630c80f9d7dca04a5ccdbec5305b8b18"
+          for n in 01 05 08; do
+            curl --fail --silent --show-error --location "$base/app-segment-$n.txt" -o "app-segment-$n.txt"
+          done
+
       - name: Verify application segments
         run: |
           node <<'NODE'
@@ -55,10 +67,17 @@ jobs:
           }
           const source = sources.join('');
           if(source.length < 100000) throw new Error(`Bundle suspeitamente pequeno: ${source.length} caracteres`);
-          // Syntax-only verification. DOM/Supabase execution happens in the browser.
           new Function(source);
           console.log(`PASS: 8 segmentos íntegros; bundle ${source.length} caracteres.`);
           NODE
+
+      - name: Prepare public files
+        run: |
+          set -euo pipefail
+          # Keep the published repository clean: the application is reconstructed
+          # in-browser from the validated segment files.
+          rm -f app-part-01.txt app-part-02.txt app-part-03.txt app-part-04.txt app-part-05.txt app-part-06.txt app-part-07.txt app-part-08.txt
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:

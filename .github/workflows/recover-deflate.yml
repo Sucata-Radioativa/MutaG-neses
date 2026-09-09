@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   zlib-recovery:
@@ -18,7 +18,7 @@ jobs:
       - name: Build zlib recovery mode
         run: |
           set -euo pipefail
-          curl -fsSL https://zlib.net/zlib-1.3.1.tar.gz -o /tmp/zlib.tar.gz
+          curl -fsSL https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz -o /tmp/zlib.tar.gz
           tar -xzf /tmp/zlib.tar.gz -C /tmp
           cd /tmp/zlib-1.3.1
           CFLAGS='-O2 -DINFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR' ./configure --static >/tmp/zlib-config.log
@@ -63,7 +63,7 @@ jobs:
           for(const n of ['01','05','08']){
             const p=`recovered-seg${n}.js`; if(!fs.existsSync(p))continue; const s=fs.readFileSync(p,'utf8');
             let syntax='FAIL'; try{new Function(s);syntax='PASS'}catch(e){syntax=e.message}
-            console.log(`SEG${n}: chars=${s.length} syntax=${syntax} head=${JSON.stringify(s.slice(0,120))}`)
+            console.log(`SEG${n}: chars=${s.length} syntax=${syntax} nul=${(s.match(/\0/g)||[]).length} head=${JSON.stringify(s.slice(0,120))}`)
           }
           NODE
       - name: Upload diagnostics

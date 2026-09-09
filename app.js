@@ -1,5 +1,5 @@
 (()=>{
-  const V='33';
+  const V='34';
   const parts=Array.from({length:8},(_,i)=>`app-part-${String(i+1).padStart(2,'0')}.txt?v=${V}`);
 
   async function get(url){
@@ -13,29 +13,22 @@
       .replace(/^\uFEFF/,'')
       .replace(/[\s\u200B\u200C\u200D]/g,'')
       .replace(/-/g,'+')
-      .replace(/_/g,'/');
+      .replace(/_/g,'/')
+      .replace(/=/g,'');
   }
 
-  function decode(text){
+  function decodeMerged(text){
     let s=clean(text);
-    if(!s || !/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length%4===1){
-      throw new Error(`Fragmento Base64 inválido: comprimento ${s.length}.`);
+    if(!s || !/^[A-Za-z0-9+/]*$/.test(s)){
+      throw new Error('Pacote Base64 inválido: caracteres inesperados.');
+    }
+    if(s.length%4===1){
+      throw new Error(`Pacote Base64 inválido: comprimento final ${s.length}.`);
     }
     if(s.length%4) s+='='.repeat(4-s.length%4);
     const bin=atob(s);
     const out=new Uint8Array(bin.length);
     for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
-    return out;
-  }
-
-  function join(list){
-    const total=list.reduce((n,b)=>n+b.length,0);
-    const out=new Uint8Array(total);
-    let offset=0;
-    for(const bytes of list){
-      out.set(bytes,offset);
-      offset+=bytes.length;
-    }
     return out;
   }
 
@@ -50,10 +43,9 @@
 
   Promise.all(parts.map(get))
     .then(async texts=>{
-      // Os app-part-* são Base64 de blocos de bytes do mesmo arquivo GZIP.
-      // Cada bloco é decodificado individualmente; depois os bytes são unidos.
-      const chunks=texts.map(decode);
-      const raw=join(chunks);
+      // app-part-* são cortes arbitrários do mesmo fluxo Base64.
+      const merged=texts.map(clean).join('');
+      const raw=decodeMerged(merged);
 
       if(raw.length<2 || raw[0]!==0x1f || raw[1]!==0x8b){
         throw new Error('Pacote GZIP inválido.');
@@ -71,7 +63,7 @@
             <div class="eyebrow">MUTAGENÊSES // ERRO DE INICIALIZAÇÃO</div>
             <h1>Falha ao abrir o terminal.</h1>
             <p class="muted">${String(err.message||err)}</p>
-            <p class="muted" style="font-size:12px">Versão ${V}. O carregador usa os fragmentos originais app-part.</p>
+            <p class="muted" style="font-size:12px">Versão ${V}. Os fragmentos Base64 são unidos antes da decodificação.</p>
           </section>
         </main>`;
     });

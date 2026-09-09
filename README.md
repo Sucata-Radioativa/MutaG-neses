@@ -2,4 +2,4 @@
 
 Site do RPG MUTAGENÊSES.
 
-Recuperação do núcleo do aplicativo e validação do GitHub Pages em andamento.
+O deploy procura automaticamente uma publicação histórica íntegra, valida o núcleo JavaScript e só então envia o site ao GitHub Pages.

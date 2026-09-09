@@ -1,0 +1,46 @@
+name: Export partial segment 8
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Export both segment 8 prefixes
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const zlib=require('node:zlib');
+          const fs=require('node:fs');
+          const crypto=require('node:crypto');
+          const versions=[
+            ['bae3b97235','seg8-bae3b97235.txt'],
+            ['750a71ece8','seg8-750a71ece8.txt']
+          ];
+          for(const [ref,name] of versions){
+            const b64=execFileSync('git',['show',`${ref}:app-segment-08.txt`],{encoding:'utf8'}).replace(/^\uFEFF/,'').replace(/\s/g,'');
+            const raw=Buffer.from(b64+'='.repeat((4-b64.length%4)%4),'base64');
+            const d=zlib.createGunzip();let chunks=[];let err='';
+            d.on('data',b=>chunks.push(Buffer.from(b)));
+            d.on('error',e=>err=`${e.code||''} ${e.message}`);
+            d.end(raw);
+            const out=Buffer.concat(chunks).toString('utf8');
+            fs.writeFileSync(name+'.js',out,'utf8');
+            fs.writeFileSync(name+'.json',JSON.stringify({ref,b64:b64.length,gzip:raw.length,partialJs:out.length,error:err,sha256:crypto.createHash('sha256').update(out).digest('hex')},null,2));
+            console.log(name,JSON.stringify({b64:b64.length,gzip:raw.length,partialJs:out.length,error:err}));
+          }
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: partial-seg8-historical
+          path: |
+            seg8-*.js
+            seg8-*.json
+          retention-days: 7

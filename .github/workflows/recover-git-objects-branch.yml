@@ -1,0 +1,39 @@
+name: Recover dangling Git objects
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scan unreachable objects and historical app signatures
+        run: |
+          set -euo pipefail
+          git fsck --full --unreachable --no-reflogs --no-progress > fsck.txt || true
+          echo '=== FSCK ==='
+          cat fsck.txt
+          echo '=== CANDIDATE BLOBS ==='
+          while read -r status sha type; do
+            if [ "$type" = blob ]; then
+              size=$(git cat-file -s "$sha" 2>/dev/null || true)
+              if [ "$size" -gt 500 ] 2>/dev/null; then
+                head=$(git cat-file blob "$sha" | head -c 200 | tr '\n' ' ' || true)
+                echo "blob=$sha size=$size head=$head"
+                if git cat-file blob "$sha" 2>/dev/null | grep -a -E -m1 'MUTAGENÊSES|MUTAGEN|appState|createCharacter|renderCharacter|app-segment|cloud-boot|Supabase' >/dev/null; then
+                  echo "*** SIGNATURE MATCH $sha ***"
+                  git cat-file blob "$sha" > "candidate-$sha.bin"
+                fi
+              fi
+            fi
+          done < fsck.txt
+          echo '=== ALL APP-RELATED BLOBS IN OBJECT DATABASE ==='
+          git rev-list --objects --all --reflog | grep -E '(app\.js|app-part|app-segment|cloud-boot|_payload|_rebuild|_pristine)' | head -200 || true
+          echo '=== DONE ==='

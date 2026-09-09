@@ -23,24 +23,41 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Verify application bundle
+      - name: Verify application segments
         run: |
           node <<'NODE'
           const fs = require('node:fs');
           const zlib = require('node:zlib');
-          const vm = require('node:vm');
-          const files = Array.from({length:8}, (_,i)=>`app-segment-${String(i+1).padStart(2,'0')}.txt`);
-          const parts = files.map(f => fs.readFileSync(f,'utf8').replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,''));
-          if(parts.some(s => !s || !/^[A-Za-z0-9+/]*$/.test(s))) throw new Error('Segmento Base64 inválido');
-          const b64 = parts.join('');
-          if(b64.length % 4 === 1) throw new Error(`Fluxo Base64 inválido: comprimento ${b64.length}`);
-          const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
-          const raw = Buffer.from(padded, 'base64');
-          if(raw[0] !== 0x1f || raw[1] !== 0x8b) throw new Error('GZIP inválido');
-          const source = zlib.gunzipSync(raw).toString('utf8');
-          if(!source.trim()) throw new Error('Aplicação vazia');
-          new vm.Script(source, {filename:'mutageneses-app-bundle.js'});
-          console.log(`PASS: bundle íntegro; ${source.length} caracteres; ${b64.length} caracteres Base64.`);
+          const crypto = require('node:crypto');
+          const expected = [
+            'e3e0fe013716dd399badaa368f313475ac63843346ca5a0ded6f8e12874047ab',
+            '68ec73ea79a0e2fb76cd5c36dac8a461eeef8950c44def7b18e1a73f3bc6ff8b',
+            '11b5ca0ef998587da388e3ba3272295b4f4342a0602c1974dd91eeec0d3aaa1d',
+            'a9dabc47e83e221f46fe5b9715c627f3372a69acd965e85ac958e9dcc2d2f866',
+            '498be539167247a84931074c124185e1c6bdba1768f9fcf39b852900b7e7f49d',
+            '215c926c3acbbf963c8c062389688d5aeb75ca630b0b7a3b8c7adb6c318e2910',
+            '20a0336aebc1e49a437df5c6f2a9f04d90e02e830a1ddd909b187912373568b0',
+            'fdeb3ec27664a59847715dc9841051933af888fade86782265b041ebaf972867'
+          ];
+          const sources = [];
+          for(let i=0;i<8;i++){
+            const name = `app-segment-${String(i+1).padStart(2,'0')}.txt`;
+            let s = fs.readFileSync(name,'utf8').replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+            if(!s || !/^[A-Za-z0-9+/]*$/.test(s) || s.length%4===1) throw new Error(`${name}: Base64 inválido (${s.length})`);
+            const digest = crypto.createHash('sha256').update(s).digest('hex');
+            if(digest !== expected[i]) throw new Error(`${name}: hash inesperado. esperado ${expected[i]}, obtido ${digest}`);
+            const padded = s + '='.repeat((4-s.length%4)%4);
+            const raw = Buffer.from(padded,'base64');
+            if(raw[0]!==0x1f || raw[1]!==0x8b) throw new Error(`${name}: GZIP inválido`);
+            const source = zlib.gunzipSync(raw).toString('utf8');
+            if(!source.trim()) throw new Error(`${name}: vazio`);
+            sources.push(source);
+          }
+          const source = sources.join('');
+          if(source.length < 100000) throw new Error(`Bundle suspeitamente pequeno: ${source.length} caracteres`);
+          // Syntax-only verification. DOM/Supabase execution happens in the browser.
+          new Function(source);
+          console.log(`PASS: 8 segmentos íntegros; bundle ${source.length} caracteres.`);
           NODE
       - name: Configure Pages
         uses: actions/configure-pages@v5

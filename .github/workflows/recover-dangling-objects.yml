@@ -1,0 +1,80 @@
+name: Recover dangling Git objects
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Scan dangling objects and identify application payloads
+        run: |
+          set -euo pipefail
+          rm -rf recovered-dangling .git/lost-found
+          mkdir -p recovered-dangling
+          git fsck --full --unreachable --dangling --no-reflogs --lost-found > fsck.txt || true
+          echo '--- dangling/unreachable summary ---'
+          grep -E 'dangling (blob|commit|tree)|unreachable (blob|commit|tree)' fsck.txt | head -300 || true
+
+          node <<'NODE'
+          const fs=require('node:fs');
+          const {execFileSync}=require('node:child_process');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const sh=a=>{try{return execFileSync('git',a,{encoding:'utf8'}).trim()}catch{return ''}};
+          const lines=fs.readFileSync('fsck.txt','utf8').split('\n').filter(x=>/(dangling|unreachable) blob /.test(x));
+          const found=[];
+          for(const line of lines){
+            const sha=line.split(/\s+/).pop();
+            if(!/^[0-9a-f]{40}$/.test(sha)) continue;
+            const size=Number(sh(['cat-file','-s',sha]));
+            let data;
+            try{data=execFileSync('git',['cat-file','blob',sha]);}catch{continue}
+            const text=data.toString('utf8').replace(/^\uFEFF/,'');
+            let kind='other', score=0, details='';
+            const clean=text.replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+            if(/^[A-Za-z0-9+/]+$/.test(clean) && clean.length%4!==1){
+              try{
+                const padded=clean+'='.repeat((4-clean.length%4)%4);
+                const raw=Buffer.from(padded,'base64');
+                if(raw[0]===0x1f&&raw[1]===0x8b){
+                  score+=100; kind='base64-gzip';
+                  try{
+                    const src=zlib.gunzipSync(raw).toString('utf8');
+                    score+=1000+Math.min(src.length,1000000)/1000;
+                    details=`gzip=${raw.length},js=${src.length},sha256=${crypto.createHash('sha256').update(src).digest('hex')}`;
+                    fs.writeFileSync(`recovered-dangling/${sha}.js`,src);
+                  }catch(e){details=`gzip=${raw.length},inflate-error=${e.code||e.message}`}
+                }
+              }catch{}
+            }
+            if(/(?:const\s+DB\s*=|appState|MUTAGENÊSES|function\s+render|cloud-boot)/.test(text)){
+              score+=500; kind='javascript-like';
+              fs.writeFileSync(`recovered-dangling/${sha}.txt`,text);
+            }
+            if(size>1000 && size<1000000 && score>0) found.push({sha,size,score,kind,details});
+          }
+          found.sort((a,b)=>b.score-a.score);
+          console.log(`candidate blobs: ${found.length}`);
+          found.forEach((x,i)=>console.log(`${i+1}. ${JSON.stringify(x)}`));
+          fs.writeFileSync('dangling-candidates.json',JSON.stringify(found,null,2));
+          NODE
+
+      - name: Upload dangling recovery candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: dangling-recovery-candidates
+          path: |
+            fsck.txt
+            dangling-candidates.json
+            recovered-dangling/
+          retention-days: 7

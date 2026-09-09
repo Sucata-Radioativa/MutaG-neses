@@ -14,26 +14,59 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Scan unreachable objects and historical app signatures
+
+      - name: Reconstruct historical app-part stream
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const src={
+            1:['9e3e9f6dadd1b7024dcd78ffc75da35da6a50165','app-part-01.txt'],
+            2:['f9990d52817b0e0cae2f1b534b94bc5ef15a95a6','app-part-02.txt'],
+            3:['c7ccd9e2cd2349b99f0fbc905b276d84f9f39996','app-part-03.txt'],
+            4:['457db1ea7d82199ed73d68ac5ff536995fff8aee','app-part-04.txt'],
+            5:['24934ad901f2a8536e85ab005f695e0f8ac7bc76','app-part-05.txt'],
+            6:['99036256a9277a798f05c5f1f25b074848448148','app-part-06.txt'],
+            7:['54467ebfe0efec6588f6faa63f60f25f0d565a08','app-part-07.txt'],
+            8:['e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1','app-part-08.txt']};
+          const bytes=[];
+          for(let i=1;i<=8;i++){
+            const [c,f]=src[i];
+            let s=execFileSync('git',['show',`${c}:${f}`],{encoding:'utf8'}).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/=/g,'').replace(/-/g,'+').replace(/_/g,'/');
+            if(s.length%4===1) throw new Error(`part${i} impossible Base64 length ${s.length}`);
+            const b=Buffer.from(s+'='.repeat((4-s.length%4)%4),'base64');
+            console.log(`part${i}: chars=${s.length} bytes=${b.length} head=${b.subarray(0,4).toString('hex')} tail=${b.subarray(-4).toString('hex')}`);
+            bytes.push(b);
+          }
+          const raw=Buffer.concat(bytes);
+          fs.writeFileSync('historical-app-part.raw',raw);
+          console.log(`RAW bytes=${raw.length} gzipHead=${raw.subarray(0,10).toString('hex')} sha=${crypto.createHash('sha256').update(raw).digest('hex')}`);
+          // Try full gzip first; then raw-DEFLATE fallback to distinguish trailer corruption from deflate corruption.
+          try{
+            const out=zlib.gunzipSync(raw);fs.writeFileSync('historical-app-part-output.js',out);console.log(`GUNZIP PASS bytes=${out.length} sha=${crypto.createHash('sha256').update(out).digest('hex')}`);
+          }catch(e){
+            console.log(`GUNZIP FAIL: ${e.message}`);
+            try{
+              const out=zlib.inflateRawSync(raw.subarray(10,-8));
+              fs.writeFileSync('historical-app-part-output.js',out);
+              console.log(`RAW-DEFLATE PASS bytes=${out.length} sha=${crypto.createHash('sha256').update(out).digest('hex')}`);
+            }catch(e2){console.log(`RAW-DEFLATE FAIL: ${e2.message}`);process.exit(2);}
+          }
+          NODE
+      - name: Upload reconstructed stream
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-app-part-stream
+          path: |
+            historical-app-part.raw
+            historical-app-part-output.js
+
+      - name: Scan unreachable Git objects
         run: |
           set -euo pipefail
           git fsck --full --unreachable --no-reflogs --no-progress > fsck.txt || true
-          echo '=== FSCK ==='
+          echo '=== UNREACHABLE OBJECTS ==='
           cat fsck.txt
-          echo '=== CANDIDATE BLOBS ==='
-          while read -r status sha type; do
-            if [ "$type" = blob ]; then
-              size=$(git cat-file -s "$sha" 2>/dev/null || true)
-              if [ "$size" -gt 500 ] 2>/dev/null; then
-                head=$(git cat-file blob "$sha" | head -c 200 | tr '\n' ' ' || true)
-                echo "blob=$sha size=$size head=$head"
-                if git cat-file blob "$sha" 2>/dev/null | grep -a -E -m1 'MUTAGENÊSES|MUTAGEN|appState|createCharacter|renderCharacter|app-segment|cloud-boot|Supabase' >/dev/null; then
-                  echo "*** SIGNATURE MATCH $sha ***"
-                  git cat-file blob "$sha" > "candidate-$sha.bin"
-                fi
-              fi
-            fi
-          done < fsck.txt
-          echo '=== ALL APP-RELATED BLOBS IN OBJECT DATABASE ==='
-          git rev-list --objects --all --reflog | grep -E '(app\.js|app-part|app-segment|cloud-boot|_payload|_rebuild|_pristine)' | head -200 || true
-          echo '=== DONE ==='

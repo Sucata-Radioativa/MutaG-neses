@@ -1,0 +1,56 @@
+name: Test app-part byte reconstruction
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Reconstruct app-part as bytes
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const fs=require('node:fs');
+          const src={
+            1:['9e3e9f6dadd1b7024dcd78ffc75da35da6a50165','app-part-01.txt'],
+            2:['f9990d52817b0e0cae2f1b534b94bc5ef15a95a6','app-part-02.txt'],
+            3:['c7ccd9e2cd2349b99f0fbc905b276d84f9f39996','app-part-03.txt'],
+            4:['457db1ea7d82199ed73d68ac5ff536995fff8aee','app-part-04.txt'],
+            5:['24934ad901f2a8536e85ab005f695e0f8ac7bc76','app-part-05.txt'],
+            6:['99036256a9277a798f05c5f1f25b074848448148','app-part-06.txt'],
+            7:['54467ebfe0efec6588f6faa63f60f25f0d565a08','app-part-07.txt'],
+            8:['e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1','app-part-08.txt']};
+          const bytes=[];
+          for(let i=1;i<=8;i++){
+            const [c,f]=src[i];
+            let s=execFileSync('git',['show',`${c}:${f}`],{encoding:'utf8'}).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+            if(s.length%4===1) throw new Error(`part ${i}: impossible base64 len ${s.length}`);
+            s+='='.repeat((4-s.length%4)%4);
+            const b=Buffer.from(s,'base64');
+            console.log(`part ${i}: b64=${s.length} bytes=${b.length} head=${b.subarray(0,4).toString('hex')}`);
+            bytes.push(b);
+          }
+          const raw=Buffer.concat(bytes);
+          console.log(`joined bytes=${raw.length} head=${raw.subarray(0,8).toString('hex')}`);
+          const out=zlib.gunzipSync(raw);
+          console.log(`PASS gunzip source=${out.length} sha256=${crypto.createHash('sha256').update(out).digest('hex')}`);
+          new Function(out.toString('utf8'));
+          fs.writeFileSync('recovered-app.js',out);
+          NODE
+      - name: Upload recovered app
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-app-bytes
+          path: recovered-app.js

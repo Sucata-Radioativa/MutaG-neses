@@ -1,0 +1,66 @@
+name: Test reconstruction backups
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Test backup reconstructions
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const {execFileSync}=require('node:child_process');
+          const sh=a=>execFileSync('git',a,{encoding:'utf8'}).trim();
+          const clean=s=>String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+          function tryB64(s){
+            s=clean(s); if(!s||!/^[A-Za-z0-9+/]*$/.test(s)||s.length%4===1)return null;
+            s+='='.repeat((4-s.length%4)%4); try{return Buffer.from(s,'base64')}catch{return null}
+          }
+          function tryGzip(name,b64){
+            const raw=tryB64(b64); if(!raw||raw[0]!==0x1f||raw[1]!==0x8b)return null;
+            try{return {name,raw,source:zlib.gunzipSync(raw).toString('utf8')}}catch{return null}
+          }
+          const candidates={1:[],5:[],8:[]};
+          const add=(seg,name,text)=>{const x=tryGzip(name,text); console.log(`${name}: chars=${clean(text).length} gzip=${x?x.raw.length:'FAIL'}`); if(x)candidates[seg].push(x)};
+          add(1,'seg01-current','app-segment-01-placeholder');
+          const p1=[]; for(let i=1;i<=5;i++)p1.push(fs.readFileSync(`_rebuild/seg01-0${i}.txt`,'utf8')); add(1,'seg01-rebuild-joined',p1.join(''));
+          const q1=[]; for(const f of ['seg01-1.txt','seg01-2.txt','seg01-3.txt'])q1.push(fs.readFileSync(`_pristine/${f}`,'utf8')); add(1,'seg01-pristine-joined',q1.join(''));
+          const p5=[]; for(const f of ['seg05-1.txt','seg05-2.txt','seg05-3.txt'])p5.push(fs.readFileSync(`_pristine/${f}`,'utf8')); add(5,'seg05-pristine-joined',p5.join(''));
+          const p8=[]; for(const f of ['seg08-1.txt','seg08-2.txt','seg08-3.txt'])p8.push(fs.readFileSync(`_pristine/${f}`,'utf8')); add(8,'seg08-pristine-joined',p8.join(''));
+          const hist={
+            1:[['c642dd6aec','app-segment-01.txt'],['296e8935b3','app-segment-01.txt']],
+            5:[['bf6225a5da','app-segment-05.txt'],['e37ff1a816','app-segment-05.txt'],['78f0a68ae9','app-segment-05.txt']],
+            8:[['bae3b97235','app-segment-08.txt'],['750a71ece8','app-segment-08.txt']]
+          };
+          for(const seg of [1,5,8]) for(const [c,f] of hist[seg]){
+            try{add(seg,`seg${seg}-hist-${c}`,sh(['show',`${c}:${f}`]));}catch(e){console.log('hist missing',seg,c)}
+          }
+          for(const seg of [1,5,8]){console.log(`VALID STANDALONE seg${seg}: ${candidates[seg].map(x=>x.name).join(', ')||'none'}`)}
+          const fixed={}; for(let i=2;i<=7;i++){
+            const s=fs.readFileSync(`app-segment-${String(i).padStart(2,'0')}.txt`,'utf8');
+            const x=tryGzip(`seg${i}`,s); if(!x) throw new Error(`seg${i} fixed invalid`); fixed[i]=x;
+          }
+          let found=null;
+          for(const a of candidates[1])for(const e of candidates[5])for(const h of candidates[8]){
+            const source=a.source+fixed[2].source+fixed[3].source+fixed[4].source+e.source+fixed[6].source+fixed[7].source+h.source;
+            try{new Function(source); found={a,e,h,source}}catch{}
+          }
+          if(!found) throw new Error('Nenhuma combinação com backups produziu JS válido.');
+          const digest=crypto.createHash('sha256').update(found.source).digest('hex');
+          console.log(`FOUND JS ${found.source.length} chars SHA256=${digest}`);
+          console.log(found.a.name,found.e.name,found.h.name);
+          fs.writeFileSync('recovered-backup-app.js',found.source);
+          NODE

@@ -40,24 +40,26 @@ jobs:
               .replace(/^\uFEFF/, '')
               .replace(/[\s\u200B\u200C\u200D]/g, '')
               .replace(/-/g, '+')
-              .replace(/_/g, '/');
+              .replace(/_/g, '/')
+              .replace(/=/g, '');
           }
 
-          function decode(text, file) {
-            let s = clean(text);
-            if (!s || !/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 === 1) {
-              throw new Error(`Fragmento Base64 inválido: ${file} length=${s.length}`);
-            }
-            if (s.length % 4) s += '='.repeat(4 - (s.length % 4));
-            return Buffer.from(s, 'base64');
+          const parts = files.map(file => clean(fs.readFileSync(file, 'utf8')));
+          if (parts.some(s => !s || !/^[A-Za-z0-9+/]*$/.test(s))) {
+            throw new Error('Fragmento Base64 contém caracteres inválidos.');
           }
 
-          // app-part-* são Base64 independentes de blocos de bytes do mesmo GZIP.
-          const chunks = files.map(file => decode(fs.readFileSync(file, 'utf8'), file));
-          const raw = Buffer.concat(chunks);
+          // Os arquivos são cortes arbitrários de um único texto Base64.
+          const merged = parts.join('');
+          if (!merged || merged.length % 4 === 1) {
+            throw new Error(`Fluxo Base64 inválido: comprimento final ${merged.length}.`);
+          }
+
+          const padded = merged + '='.repeat((4 - (merged.length % 4)) % 4);
+          const raw = Buffer.from(padded, 'base64');
 
           if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) {
-            throw new Error('Pacote GZIP inválido.');
+            throw new Error('Fluxo GZIP inválido.');
           }
 
           const source = zlib.gunzipSync(raw).toString('utf8');

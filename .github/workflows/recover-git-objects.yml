@@ -1,0 +1,54 @@
+name: Recover Git objects
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scan unreachable Git objects
+        run: |
+          set -euo pipefail
+          echo '--- refs ---'
+          git show-ref || true
+          echo '--- fsck ---'
+          git fsck --full --unreachable --no-reflogs > fsck.txt || true
+          cat fsck.txt
+          echo '--- candidate objects ---'
+          : > candidates.txt
+          while read -r kind sha rest; do
+            case "$kind" in
+              unreachable|dangling)
+                type=$(git cat-file -t "$sha" 2>/dev/null || true)
+                if [ "$type" = blob ]; then
+                  size=$(git cat-file -s "$sha")
+                  head=$(git cat-file blob "$sha" | head -c 120 | tr '\n' ' ' || true)
+                  echo "BLOB $sha size=$size head=$head" | tee -a candidates.txt
+                elif [ "$type" = commit ] || [ "$type" = tree ]; then
+                  echo "$kind $sha type=$type" | tee -a candidates.txt
+                fi
+              esac
+          done < fsck.txt
+          echo '--- keyword blobs ---'
+          while read -r line; do
+            sha=$(echo "$line" | awk '{print $2}')
+            case "$sha" in
+              [0-9a-fA-F]*)
+                if git cat-file -e "$sha" 2>/dev/null; then
+                  if git cat-file blob "$sha" 2>/dev/null | grep -a -E -m1 'MUTAGENÊSES|appState|app-segment|app-part|cloud-boot|createCharacter|render\(' >/dev/null; then
+                    echo "MATCH $sha"
+                    git cat-file blob "$sha" > "match-$sha.bin"
+                  fi
+                fi
+              ;;
+            esac
+          done < candidates.txt
+          echo '--- done ---'
+          find . -maxdepth 1 -type f -name 'match-*' -printf '%f %s bytes\n' || true

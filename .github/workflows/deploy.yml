@@ -24,33 +24,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # These are the immutable pristine copies from the last known-good build.
-      - name: Restore pristine application segments
-        run: |
-          set -euo pipefail
-          base="https://raw.githubusercontent.com/Sucata-Radioativa/MutaG-neses/4031a956630c80f9d7dca04a5ccdbec5305b8b18"
-          for n in 01 05 08; do
-            curl --fail --silent --show-error --location "$base/app-segment-$n.txt" -o "app-segment-$n.txt"
-          done
-
-      - name: Rebuild application bundle
-        run: node build-app.js
-
-      - name: Prepare public files
-        run: |
-          set -euo pipefail
-          rm -f app-part-01.txt app-part-02.txt app-part-03.txt app-part-04.txt app-part-05.txt app-part-06.txt app-part-07.txt app-part-08.txt
-          rm -f app-segment-01.txt app-segment-02.txt app-segment-03.txt app-segment-04.txt app-segment-05.txt app-segment-06.txt app-segment-07.txt app-segment-08.txt
-          rm -f app.js
-
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:
           enablement: true
+
       - name: Upload site
         uses: actions/upload-pages-artifact@v4
         with:
           path: .
+
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4

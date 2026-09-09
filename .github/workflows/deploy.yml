@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Verify application bundle
+      - name: Diagnose and verify application bundle
         run: |
           node <<'NODE'
           const fs = require('node:fs');
@@ -46,27 +46,51 @@ jobs:
 
           const parts = files.map(file => clean(fs.readFileSync(file, 'utf8')));
           if (parts.some(s => !s || !/^[A-Za-z0-9+/]*$/.test(s))) {
-            throw new Error('Fragmento Base64 contém caracteres inválidos.');
+            throw new Error('Fragmentos app-part contêm caracteres Base64 inválidos.');
           }
 
-          // Os arquivos são cortes arbitrários de um único texto Base64.
-          const merged = parts.join('');
-          if (!merged || merged.length % 4 === 1) {
-            throw new Error(`Fluxo Base64 inválido: comprimento final ${merged.length}.`);
+          function tryJoined(order) {
+            const merged = order.map(i => parts[i]).join('');
+            if (merged.length % 4 === 1) return null;
+            const padded = merged + '='.repeat((4 - (merged.length % 4)) % 4);
+            try {
+              const raw = Buffer.from(padded, 'base64');
+              if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) return null;
+              const source = zlib.gunzipSync(raw).toString('utf8');
+              if (!source.trim()) return null;
+              new vm.Script(source);
+              return {order, source, raw};
+            } catch {
+              return null;
+            }
           }
 
-          const padded = merged + '='.repeat((4 - (merged.length % 4)) % 4);
-          const raw = Buffer.from(padded, 'base64');
-
-          if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) {
-            throw new Error('Fluxo GZIP inválido.');
+          function permutations(items) {
+            const out = [];
+            function rec(prefix, rest) {
+              if (rest.length === 0) { out.push(prefix); return; }
+              for (let i = 0; i < rest.length; i++) {
+                rec(prefix.concat(rest[i]), rest.slice(0, i).concat(rest.slice(i + 1)));
+              }
+            }
+            rec([], items);
+            return out;
           }
 
-          const source = zlib.gunzipSync(raw).toString('utf8');
-          if (!source.trim()) throw new Error('Aplicação vazia.');
-          new vm.Script(source, { filename: 'mutageneses-app-bundle.js' });
+          // Testa a ordem nominal e, para diagnóstico, todas as 8! permutações.
+          let found = tryJoined([0,1,2,3,4,5,6,7]);
+          if (!found) {
+            for (const order of permutations([0,1,2,3,4,5,6,7])) {
+              found = tryJoined(order);
+              if (found) break;
+            }
+          }
 
-          console.log(`PASS: bundle íntegro; ${source.length} caracteres; ${raw.length} bytes GZIP.`);
+          if (!found) {
+            throw new Error('Nenhuma ordem dos 8 app-part produz um GZIP válido. Payload está corrompido/incompatível.');
+          }
+
+          console.log(`PASS: bundle íntegro; ordem=${found.order.map(i => i + 1).join('-')}; ${found.source.length} caracteres; ${found.raw.length} bytes GZIP.`);
           NODE
 
       - name: Configure Pages

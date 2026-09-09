@@ -26,6 +26,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Scan dangling Git objects for lost application blobs
+        run: |
+          set -euo pipefail
+          git fsck --full --unreachable --no-reflogs --no-progress > /tmp/fsck.txt || true
+          echo '=== UNREACHABLE LARGE BLOBS ==='
+          while read -r state type sha; do
+            [ "$state" = unreachable ] || [ "$state" = dangling ] || continue
+            [ "$type" = blob ] || continue
+            size=$(git cat-file -s "$sha" 2>/dev/null || echo 0)
+            if [ "$size" -ge 4000 ]; then
+              echo "$sha size=$size"
+              git cat-file blob "$sha" | head -c 100 | od -An -tx1c || true
+            fi
+          done < /tmp/fsck.txt
+          echo '=== END FSCK ==='
+
       - name: Restore valid historical gzip segments
         run: |
           set -euo pipefail

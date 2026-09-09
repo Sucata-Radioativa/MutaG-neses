@@ -36,20 +36,25 @@ jobs:
           );
 
           function cleanPart(text) {
-            return String(text ?? '')
+            const s = String(text ?? '')
               .replace(/^\uFEFF/, '')
               .replace(/[\s\u200B\u200C\u200D]/g, '')
               .replace(/-/g, '+')
               .replace(/_/g, '/')
               .replace(/=/g, '');
+            if (!s || !/^[A-Za-z0-9+/]*$/.test(s)) {
+              throw new Error('Fragmento Base64 inválido.');
+            }
+            return s;
           }
 
           const parts = files.map(file => cleanPart(fs.readFileSync(file, 'utf8')));
-          if (parts.some(s => !s || !/^[A-Za-z0-9+/]*$/.test(s) || s.length % 4 === 1)) {
-            throw new Error('Segmento Base64 inválido.');
+          const merged = parts.join('');
+
+          if (merged.length % 4 === 1) {
+            throw new Error(`Fluxo Base64 inválido: comprimento ${merged.length}.`);
           }
 
-          const merged = parts.join('');
           const padded = merged + '='.repeat((4 - (merged.length % 4)) % 4);
           const raw = Buffer.from(padded, 'base64');
 

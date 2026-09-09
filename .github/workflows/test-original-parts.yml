@@ -15,46 +15,55 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Test original payload snapshots
+      - name: Reconstruct original payload chain
         run: |
           node <<'NODE'
           const {execFileSync} = require('node:child_process');
           const zlib = require('node:zlib');
           const fs = require('node:fs');
 
-          const snapshots = [
-            'e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1',
-            '54467ebfe0efec6588f6faa63f60f25f0d565a08',
-            '99036256a9277a798f05c5f1f25b074848448148'
-          ];
-          const files = Array.from({length:8},(_,i)=>`app-part-${String(i+1).padStart(2,'0')}.txt`);
-
-          function show(commit,file){
-            try{return execFileSync('git',['show',`${commit}:${file}`],{encoding:'utf8'});}catch{return null;}
+          function sh(args){ return execFileSync('git', args, {encoding:'utf8'}).trim(); }
+          function show(commit,file){ try{return execFileSync('git',['show',`${commit}:${file}`],{encoding:'utf8'});}catch{return null;} }
+          function parent(commit){
+            const line=sh(['rev-list','--parents','-n','1',commit]);
+            const p=line.split(/\s+/);
+            return p[1] || null;
           }
-          function clean(s){return String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');}
-          function test(commit){
-            const parts=files.map(f=>show(commit,f));
-            if(parts.some(x=>x===null)){console.log(`SNAPSHOT ${commit}: incomplete`);return false;}
-            const cleaned=parts.map(clean);
-            console.log(`SNAPSHOT ${commit}: sizes=${cleaned.map(x=>x.length).join(',')} total=${cleaned.join('').length}`);
 
-            const merged=cleaned.join('');
-            if(merged.length%4!==1){
-              const padded=merged+'='.repeat((4-merged.length%4)%4);
-              const raw=Buffer.from(padded,'base64');
-              console.log(`  merged: raw=${raw.length} sig=${raw.subarray(0,4).toString('hex')}`);
-              try{const out=zlib.gunzipSync(raw);console.log(`  merged GZIP PASS: out=${out.length}`);fs.writeFileSync(`bundle-${commit.slice(0,7)}.js`,out);return true;}catch(e){console.log(`  merged GZIP FAIL: ${e.message}`);}
-            } else console.log('  merged: Base64 length mod 4 = 1');
-
-            const decoded=cleaned.map(s=>{if(s.length%4===1)return null;const p=s+'='.repeat((4-s.length%4)%4);return Buffer.from(p,'base64');});
-            if(decoded.every(Boolean)){
-              const raw=Buffer.concat(decoded);console.log(`  per-part: raw=${raw.length} sig=${raw.subarray(0,4).toString('hex')}`);
-              try{const out=zlib.gunzipSync(raw);console.log(`  per-part GZIP PASS: out=${out.length}`);return true;}catch(e){console.log(`  per-part GZIP FAIL: ${e.message}`);}
+          const found = {};
+          let commit='e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1';
+          const seen=new Set();
+          while(commit && !seen.has(commit) && Object.keys(found).length<8){
+            seen.add(commit);
+            const message=sh(['show','-s','--format=%s',commit]);
+            const m=message.match(/^chore: add cloud app payload part (\d+)$/);
+            if(m){
+              const n=Number(m[1]);
+              const file=`app-part-${String(n).padStart(2,'0')}.txt`;
+              const content=show(commit,file);
+              if(content!==null){
+                found[n]={commit,content};
+                console.log(`FOUND part ${n} at ${commit}: ${content.replace(/\n/g,'').length} chars`);
+              }
             }
-            return false;
+            commit=parent(commit);
           }
 
-          let any=false; for(const c of snapshots) any ||= test(c);
-          if(!any) process.exitCode=1;
+          if(Object.keys(found).length!==8){
+            throw new Error(`Não foi possível recuperar os 8 commits originais. Encontrados: ${Object.keys(found).sort().join(',')}`);
+          }
+
+          function clean(s){return String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');}
+          const parts=[];
+          for(let i=1;i<=8;i++) parts.push(clean(found[i].content));
+          const merged=parts.join('');
+          console.log(`TOTAL Base64: ${merged.length} chars; mod4=${merged.length%4}`);
+          if(merged.length%4===1) throw new Error('Fluxo Base64 reconstruído inválido (mod 4 = 1).');
+          const padded=merged+'='.repeat((4-merged.length%4)%4);
+          const raw=Buffer.from(padded,'base64');
+          console.log(`Decoded bytes: ${raw.length}; signature=${raw.subarray(0,4).toString('hex')}`);
+          if(raw[0]!==0x1f||raw[1]!==0x8b) throw new Error('Cabeçalho GZIP inválido.');
+          const out=zlib.gunzipSync(raw);
+          console.log(`GZIP PASS: ${out.length} bytes JS`);
+          fs.writeFileSync('recovered-app.js',out);
           NODE

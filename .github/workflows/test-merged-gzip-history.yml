@@ -1,0 +1,114 @@
+name: Test merged GZIP history
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Find valid merged GZIP combination
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const {execFileSync} = require('node:child_process');
+          const zlib = require('node:zlib');
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+
+          const sh = args => execFileSync('git', args, {encoding:'utf8'}).trim();
+          const clean = s => String(s ?? '')
+            .replace(/^\uFEFF/, '')
+            .replace(/[\s\u200B\u200C\u200D]/g, '')
+            .replace(/-/g, '+')
+            .replace(/_/g, '/')
+            .replace(/=/g, '');
+
+          const candidates = [];
+          for (let n = 1; n <= 8; n++) {
+            const file = `app-segment-${String(n).padStart(2,'0')}.txt`;
+            const commits = sh(['log','--all','--format=%H','--',file]).split(/\s+/).filter(Boolean);
+            const map = new Map();
+            for (const commit of commits) {
+              let blob, text;
+              try {
+                blob = sh(['rev-parse', `${commit}:${file}`]);
+                text = clean(execFileSync('git', ['show', `${commit}:${file}`], {encoding:'utf8'}));
+              } catch { continue; }
+              if (!text || !/^[A-Za-z0-9+/]*$/.test(text)) continue;
+              if (!map.has(blob)) map.set(blob, {blob, commit, text});
+            }
+            candidates.push([...map.values()]);
+            console.log(`segment ${n}: ${map.size} candidate blobs`);
+            for (const c of map.values()) console.log(`  ${c.blob} len=${c.text.length} commit=${c.commit}`);
+          }
+
+          if (candidates.some(x => x.length === 0)) throw new Error('Segmento sem candidatos históricos.');
+
+          function tryDecode(parts) {
+            const merged = parts.map(x => x.text).join('');
+            if (!merged || merged.length % 4 === 1) return null;
+            const padded = merged + '='.repeat((4 - merged.length % 4) % 4);
+            let raw;
+            try { raw = Buffer.from(padded, 'base64'); } catch { return null; }
+            if (raw.length < 18 || raw[0] !== 0x1f || raw[1] !== 0x8b) return null;
+            try {
+              const source = zlib.gunzipSync(raw).toString('utf8');
+              if (!source.trim()) return null;
+              try { new Function(source); } catch { return null; }
+              return {merged, raw, source};
+            } catch { return null; }
+          }
+
+          let tested = 0;
+          let found = null;
+          const chosen = [];
+          function rec(i) {
+            if (found) return;
+            if (i === 8) {
+              tested++;
+              const result = tryDecode(chosen);
+              if (result) found = {chosen:[...chosen], ...result};
+              return;
+            }
+            for (const c of candidates[i]) {
+              chosen.push(c);
+              rec(i+1);
+              chosen.pop();
+              if (found) return;
+            }
+          }
+          rec(0);
+
+          console.log(`Combinations tested: ${tested}`);
+          if (!found) throw new Error('Nenhuma combinação histórica forma um GZIP + JavaScript válido.');
+
+          const digest = crypto.createHash('sha256').update(found.source).digest('hex');
+          console.log('FOUND VALID APPLICATION');
+          found.chosen.forEach((x,i) => console.log(`segment ${i+1}: ${x.blob} from ${x.commit} len=${x.text.length}`));
+          console.log(`merged_base64=${found.merged.length}`);
+          console.log(`gzip_bytes=${found.raw.length}`);
+          console.log(`js_chars=${found.source.length}`);
+          console.log(`sha256=${digest}`);
+
+          fs.writeFileSync('recovered-app.js', found.source, 'utf8');
+          fs.writeFileSync('recovery-manifest.json', JSON.stringify({sha256:digest, chosen:found.chosen.map((x,i)=>({segment:i+1,blob:x.blob,commit:x.commit}))}, null, 2));
+          NODE
+
+      - name: Upload recovered source
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-app-source
+          path: |
+            recovered-app.js
+            recovery-manifest.json
+          retention-days: 7

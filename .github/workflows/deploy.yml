@@ -21,52 +21,91 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout full history
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Restore known-good application segments
-        run: |
-          set -euo pipefail
-          cat _pristine/seg01-1.txt _pristine/seg01-2.txt _pristine/seg01-3.txt > app-segment-01.txt
-          cat _pristine/seg05-1.txt _pristine/seg05-2.txt _pristine/seg05-3.txt > app-segment-05.txt
-          cat _pristine/seg08-1.txt _pristine/seg08-2.txt _pristine/seg08-3.txt > app-segment-08.txt
-
-      - name: Rebuild application bundle from merged Base64 stream
+      - name: Recover and build application from a valid historical payload
         run: |
           node <<'NODE'
+          const {execFileSync} = require('node:child_process');
           const fs = require('node:fs');
           const zlib = require('node:zlib');
           const vm = require('node:vm');
 
-          const files = Array.from({length: 8}, (_, i) =>
-            `app-segment-${String(i + 1).padStart(2, '0')}.txt`
-          );
+          const names = Array.from({length: 8}, (_, i) => `app-part-${String(i + 1).padStart(2, '0')}.txt`);
+          const commits = execFileSync('git', ['log', '--format=%H', '--', ...names], {encoding: 'utf8'})
+            .trim().split(/\s+/).filter(Boolean);
+
+          function readAt(commit, file) {
+            try {
+              return execFileSync('git', ['show', `${commit}:${file}`], {encoding: 'utf8'});
+            } catch {
+              return null;
+            }
+          }
 
           function clean(text) {
             return String(text ?? '')
               .replace(/^\uFEFF/, '')
               .replace(/[\s\u200B\u200C\u200D]/g, '')
               .replace(/-/g, '+')
-              .replace(/_/g, '/')
-              .replace(/=/g, '');
+              .replace(/_/g, '/');
           }
 
-          const merged = files.map(file => clean(fs.readFileSync(file, 'utf8'))).join('');
-          if (!merged || merged.length % 4 === 1) {
-            throw new Error(`Base64 final inválido: comprimento=${merged.length}`);
+          function decodePart(text) {
+            let s = clean(text);
+            if (!s || !/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 === 1) return null;
+            if (s.length % 4) s += '='.repeat(4 - (s.length % 4));
+            try { return Buffer.from(s, 'base64'); } catch { return null; }
           }
 
-          const padded = merged + '='.repeat((4 - (merged.length % 4)) % 4);
-          const raw = Buffer.from(padded, 'base64');
-          if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) {
-            throw new Error(`GZIP inválido: assinatura=${raw.subarray(0, 4).toString('hex')}`);
+          function tryDecodedIndividually(parts) {
+            const decoded = parts.map(decodePart);
+            if (decoded.some(x => !x)) return null;
+            const raw = Buffer.concat(decoded);
+            if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) return null;
+            try {
+              const core = zlib.gunzipSync(raw).toString('utf8');
+              if (!core.trim()) return null;
+              new vm.Script(core);
+              return {mode: 'per-part', core, raw};
+            } catch { return null; }
           }
 
-          const bundle = zlib.gunzipSync(raw).toString('utf8');
-          if (!bundle.trim()) throw new Error('Bundle vazio.');
-          new vm.Script(bundle, {filename: 'mutageneses-app.bundle.js'});
-          fs.writeFileSync('app.bundle.js', bundle, 'utf8');
-          console.log(`PASS: bundle reconstruído e validado; ${bundle.length} caracteres JS; ${raw.length} bytes GZIP.`);
+          function tryMergedBase64(parts) {
+            let merged = parts.map(clean).join('');
+            if (!merged || !/^[A-Za-z0-9+/]*={0,2}$/.test(merged) || merged.length % 4 === 1) return null;
+            if (merged.length % 4) merged += '='.repeat(4 - (merged.length % 4));
+            const raw = Buffer.from(merged, 'base64');
+            if (raw.length < 2 || raw[0] !== 0x1f || raw[1] !== 0x8b) return null;
+            try {
+              const core = zlib.gunzipSync(raw).toString('utf8');
+              if (!core.trim()) return null;
+              new vm.Script(core);
+              return {mode: 'merged', core, raw};
+            } catch { return null; }
+          }
+
+          let found = null;
+          for (const commit of commits) {
+            const parts = names.map(name => readAt(commit, name));
+            if (parts.some(x => x === null)) continue;
+            found = tryDecodedIndividually(parts) || tryMergedBase64(parts);
+            if (found) {
+              console.log(`FOUND valid payload at ${commit} using ${found.mode}.`);
+              fs.writeFileSync('.found-payload-commit', commit, 'utf8');
+              fs.writeFileSync('app.bundle.js', found.core + '\n;\n' + fs.readFileSync('cloud-boot.js', 'utf8'), 'utf8');
+              new vm.Script(fs.readFileSync('app.bundle.js', 'utf8'), {filename: 'app.bundle.js'});
+              console.log(`PASS: app.bundle.js valid; ${found.core.length} core chars; ${found.raw.length} gzip bytes.`);
+              break;
+            }
+          }
+
+          if (!found) {
+            throw new Error('Nenhuma versão histórica de app-part-01..08 produz um GZIP válido.');
+          }
           NODE
 
       - name: Configure Pages

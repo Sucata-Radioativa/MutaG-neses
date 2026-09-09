@@ -46,9 +46,16 @@ jobs:
       - name: Decode and recover damaged segments
         run: |
           set -euo pipefail
-          for n in 01 02 03 04 05 06 07 08; do
-            tr -d '\r\n\t ' < "app-segment-${n}.txt" | base64 -d > "/tmp/seg${n}.gz"
-          done
+          node <<'NODE'
+          const fs=require('node:fs');
+          const names=['01','02','03','04','05','06','07','08'];
+          for(const n of names){
+            let s=fs.readFileSync(`app-segment-${n}.txt`,'utf8').replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+            if(!s || !/^[A-Za-z0-9+/]*$/.test(s) || s.length%4===1) throw new Error(`segment ${n}: invalid base64 length ${s.length}`);
+            s+='='.repeat((4-s.length%4)%4);
+            fs.writeFileSync(`/tmp/seg${n}.gz`,Buffer.from(s,'base64'));
+          }
+          NODE
 
           /tmp/gzrecover -p -v /tmp/seg01.gz > /tmp/seg01.recovered.js 2> /tmp/seg01.recovery.log || true
           /tmp/gzrecover -p -v /tmp/seg08.gz > /tmp/seg08.recovered.js 2> /tmp/seg08.recovery.log || true
@@ -57,28 +64,22 @@ jobs:
           const fs=require('node:fs');
           const zlib=require('node:zlib');
           const vm=require('node:vm');
-          const path=require('node:path');
           const valid=[];
-          for(let i=2;i<=7;i++){
-            const n=String(i).padStart(2,'0');
-            const b=zlib.gunzipSync(fs.readFileSync(`/tmp/seg${n}.gz`)).toString('utf8');
-            valid.push(b);
-          }
+          for(let i=2;i<=7;i++) valid.push(zlib.gunzipSync(fs.readFileSync(`/tmp/seg${String(i).padStart(2,'0')}.gz`)).toString('utf8'));
           const r1=fs.readFileSync('/tmp/seg01.recovered.js','utf8');
           const r8=fs.readFileSync('/tmp/seg08.recovered.js','utf8');
           console.log(`recovered seg01=${r1.length} seg08=${r8.length}`);
+          console.log('--- seg01 recovery log ---');
           console.log(fs.readFileSync('/tmp/seg01.recovery.log','utf8'));
+          console.log('--- seg08 recovery log ---');
           console.log(fs.readFileSync('/tmp/seg08.recovery.log','utf8'));
-
-          // Try the natural reconstruction first.
           const full=r1+valid.join('')+r8;
           try{
             new vm.Script(full,{filename:'mutageneses-recovered.js'});
             fs.writeFileSync('app-core.js',full,'utf8');
-            console.log(`PASS NATURAL RECOVERY: ${full.length} JS chars`);
+            console.log(`PASS NATURAL RECOVERY: ${full.length} chars`);
           }catch(e){
-            console.log(`Natural parse failed: ${e.message}`);
-            // Save all material for later diagnostics.
+            console.log(`Natural reconstruction parse: ${e.message}`);
             fs.writeFileSync('recovery-seg01.js',r1,'utf8');
             fs.writeFileSync('recovery-seg08.js',r8,'utf8');
             process.exit(2);

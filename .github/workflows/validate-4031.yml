@@ -1,0 +1,55 @@
+name: Validate 4031 known-good snapshot
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Restore all eight segments from 4031
+        run: |
+          set -euo pipefail
+          for n in 01 02 03 04 05 06 07 08; do
+            git show 4031a956630c80f9d7dca04a5ccdbec5305b8b18:app-segment-$n.txt > app-segment-$n.txt
+          done
+      - name: Validate and build bundle
+        run: |
+          node <<'NODE'
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const parts=[];
+          for(let i=1;i<=8;i++){
+            const f=`app-segment-${String(i).padStart(2,'0')}.txt`;
+            let s=fs.readFileSync(f,'utf8').replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+            if(!s||s.length%4===1||!/^[A-Za-z0-9+/]*$/.test(s))throw new Error(`${f}: invalid Base64 (${s.length})`);
+            s+='='.repeat((4-s.length%4)%4);
+            const raw=Buffer.from(s,'base64');
+            if(raw[0]!==0x1f||raw[1]!==0x8b)throw new Error(`${f}: invalid gzip header`);
+            const source=zlib.gunzipSync(raw).toString('utf8');
+            new Function(source);
+            console.log(`${f}: PASS b64=${s.length} gzip=${raw.length} js=${source.length} sha256=${crypto.createHash('sha256').update(source).digest('hex')}`);
+            parts.push(source);
+          }
+          const core=parts.join('');
+          new Function(core);
+          const cloud=fs.readFileSync('cloud-boot.js','utf8');
+          const bundle=core+'\n;\n'+cloud;
+          new Function(bundle);
+          fs.writeFileSync('app.bundle.js',bundle);
+          console.log(`BUNDLE PASS core=${core.length} bundle=${bundle.length} sha256=${crypto.createHash('sha256').update(bundle).digest('hex')}`);
+          NODE
+      - name: Upload validated bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-4031-bundle
+          path: app.bundle.js

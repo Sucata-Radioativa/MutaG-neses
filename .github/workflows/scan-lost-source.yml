@@ -1,0 +1,48 @@
+name: Scan lost source blobs
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scan unreachable objects for JavaScript/source
+        run: |
+          set -euo pipefail
+          git fsck --full --unreachable --no-reflogs --no-progress > fsck.txt || true
+          rm -rf lost-blobs
+          mkdir -p lost-blobs
+          while read -r state type sha; do
+            [ "$state" = unreachable ] || [ "$state" = dangling ] || continue
+            [ "$type" = blob ] || continue
+            size=$(git cat-file -s "$sha" 2>/dev/null || echo 0)
+            [ "$size" -ge 8000 ] || continue
+            git cat-file blob "$sha" > "lost-blobs/$sha.bin"
+            head=$(head -c 160 "lost-blobs/$sha.bin" | tr '\0' ' ' | tr '\n' ' ')
+            case "$head" in
+              *appState*|*function*|*const\ DB*|*render*|*MUTAGENÊSES*|*DOCTYPE*|*<script*)
+                echo "POSSIBLE SOURCE sha=$sha size=$size head=$head" >> lost-candidates.txt;;
+            esac
+          done < fsck.txt
+          echo '=== CANDIDATES ==='
+          cat lost-candidates.txt 2>/dev/null || true
+          echo '=== LARGE UNREACHABLE BLOBS ==='
+          find lost-blobs -type f -printf '%f %s\n' | sort -k2nr | head -100
+      - name: Upload lost blobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: lost-source-blobs
+          path: |
+            fsck.txt
+            lost-candidates.txt
+            lost-blobs/
+          retention-days: 2

@@ -1,0 +1,83 @@
+name: Recover corrupted gzip segments
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build gzrecover
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/arenn/gzrt/master/gzrecover.c -o /tmp/gzrecover.c
+          gcc -O2 -o /tmp/gzrecover /tmp/gzrecover.c -lz
+          /tmp/gzrecover -V
+
+      - name: Recover every historical copy of segments 01, 05 and 08
+        run: |
+          set -euo pipefail
+          mkdir -p recovery-output
+          node <<'NODE'
+          const {execFileSync}=require('node:child_process');
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const sh=(a)=>execFileSync('git',a,{encoding:'utf8'}).trim();
+          function clean(s){return String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');}
+          function decode(s){
+            s=clean(s);
+            if(!s||!/^[A-Za-z0-9+/]*$/.test(s))return null;
+            if(s.length%4===1)return null;
+            return Buffer.from(s+'='.repeat((4-s.length%4)%4),'base64');
+          }
+          const segments=[1,5,8];
+          const manifest=[];
+          for(const n of segments){
+            const f=`app-segment-${String(n).padStart(2,'0')}.txt`;
+            const commits=sh(['log','--all','--format=%H','--',f]).split(/\s+/).filter(Boolean);
+            const blobs=new Map();
+            for(const c of commits){
+              let blob,text;
+              try{blob=sh(['rev-parse',`${c}:${f}`]); text=execFileSync('git',['show',`${c}:${f}`],{encoding:'utf8'});}catch{continue;}
+              if(!blobs.has(blob))blobs.set(blob,{commit:c,blob,text});
+            }
+            for(const [blob,x] of blobs){
+              const raw=decode(x.text);
+              if(!raw){manifest.push({segment:n,commit:x.commit,blob,base64:'invalid',gzip:'n/a'});continue;}
+              let direct=null;
+              try{direct=zlib.gunzipSync(raw).toString('utf8')}catch{}
+              if(direct){
+                fs.writeFileSync(`recovery-output/seg${String(n).padStart(2,'0')}-${blob}.js`,direct);
+                manifest.push({segment:n,commit:x.commit,blob,base64:'valid',gzip:'direct',sourceLength:direct.length,sha256:crypto.createHash('sha256').update(direct).digest('hex')});
+                continue;
+              }
+              fs.writeFileSync(`/tmp/seg-${n}-${blob}.gz`,raw);
+              execFileSync('/tmp/gzrecover',['-p','-v',`/tmp/seg-${n}-${blob}.gz`],{stdio:['ignore',fs.openSync(`/tmp/gz-${n}-${blob}.recovered.js`,'w'),fs.openSync(`/tmp/gz-${n}-${blob}.log`,'w')]});
+              const recovered=fs.readFileSync(`/tmp/gz-${n}-${blob}.recovered.js`,'utf8');
+              fs.writeFileSync(`recovery-output/seg${String(n).padStart(2,'0')}-${blob}.js`,recovered);
+              let syntax=false; try{new Function(recovered); syntax=true}catch{}
+              const log=fs.readFileSync(`/tmp/gz-${n}-${blob}.log`,'utf8');
+              manifest.push({segment:n,commit:x.commit,blob,base64:'valid',gzip:'recovered',sourceLength:recovered.length,syntax,log});
+            }
+          }
+          fs.writeFileSync('recovery-output/manifest.json',JSON.stringify(manifest,null,2));
+          console.log(JSON.stringify(manifest,null,2));
+          NODE
+
+      - name: Upload recovery candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: gzip-recovery-candidates
+          path: recovery-output/
+          retention-days: 7

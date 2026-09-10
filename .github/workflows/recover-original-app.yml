@@ -1,0 +1,75 @@
+name: Recover original app payload
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct original payload from first complete snapshot
+        run: |
+          set -euo pipefail
+          ORIG=e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1
+          mkdir -p /tmp/original
+          for n in 01 02 03 04 05 06 07 08; do
+            git show "$ORIG:app-part-$n.txt" > "/tmp/original/app-part-$n.txt"
+          done
+          node <<'NODE'
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const crypto=require('node:crypto');
+          const parts=[];
+          for(let i=1;i<=8;i++){
+            const s=fs.readFileSync(`/tmp/original/app-part-${String(i).padStart(2,'0')}.txt`,'utf8')
+              .replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'');
+            parts.push(s);
+            console.log(`part${i}: ${s.length} chars tail=${JSON.stringify(s.slice(-16))}`);
+          }
+          const merged=parts.join('');
+          console.log(`MERGED=${merged.length} mod4=${merged.length%4}`);
+          if(!/^[A-Za-z0-9+/=]+$/.test(merged)) throw new Error('Unexpected characters in original payload');
+          const raw=Buffer.from(merged,'base64');
+          console.log(`GZIP_BYTES=${raw.length} header=${raw.subarray(0,2).toString('hex')}`);
+          fs.writeFileSync('/tmp/original/app.gz',raw);
+          try{
+            const source=zlib.gunzipSync(raw).toString('utf8');
+            console.log(`GUNZIP_OK source=${source.length} sha256=${crypto.createHash('sha256').update(source).digest('hex')}`);
+            new Function(source);
+            fs.writeFileSync('recovered-original-app.js',source,'utf8');
+          }catch(e){
+            console.error(`GUNZIP_FAILED ${e.message}`);
+            process.exit(2);
+          }
+          NODE
+
+      - name: Publish recovered source to recovery branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp recovered-original-app.js /tmp/original-app.js
+          cp /tmp/original/app-part-*.txt .
+          git add recovered-original-app.js app-part-*.txt
+          git diff --cached --quiet && exit 0
+          git commit -m "recovery: restore original application source"
+          git push origin HEAD:recovery/diagnose-segments
+
+      - name: Upload recovery evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-original-app
+          path: |
+            recovered-original-app.js
+            /tmp/original/app.gz
+            /tmp/original/app-part-*.txt

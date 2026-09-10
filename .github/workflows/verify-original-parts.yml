@@ -1,0 +1,94 @@
+name: Verify original application payload
+
+on:
+  push:
+    branches: [recovery/diagnose-segments]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild original app from original part commits
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs=require('node:fs');
+          const zlib=require('node:zlib');
+          const vm=require('node:vm');
+          const crypto=require('node:crypto');
+          const {execFileSync}=require('node:child_process');
+          const sh=(args)=>execFileSync('git',args,{encoding:'utf8'});
+          const src={
+            1:'6900339e3fa41fc06f46567da2b9e2963b8b6507',
+            2:'f9990d52817b0e0cae2f1b534b94bc5ef15a95a6',
+            3:'c7ccd9e2cd2349b99f0fbc905b276d84f9f39996',
+            4:'457db1ea7d82199ed73d68ac5ff536995fff8aee',
+            5:'24934ad901f2a8536e85ab005f695e0f8ac7bc76',
+            6:'99036256a9277a798f05c5f1f25b074848448148',
+            7:'54467ebfe0efec6588f6faa63f60f25f0d565a08',
+            8:'e370e02d5a8c9f2afc63e711e33acfc3cbfbecc1'
+          };
+          function clean(s){
+            return String(s).replace(/^\uFEFF/,'').replace(/[\s\u200B\u200C\u200D]/g,'').replace(/-/g,'+').replace(/_/g,'/').replace(/=/g,'');
+          }
+          const rawParts=[];
+          for(let i=1;i<=8;i++){
+            const file=`app-part-${String(i).padStart(2,'0')}.txt`;
+            const text=clean(sh(['show',`${src[i]}:${file}`]));
+            if(!text || !/^[A-Za-z0-9+/]*$/.test(text)) throw new Error(`part ${i}: invalid Base64 characters`);
+            if(text.length%4===1) throw new Error(`part ${i}: impossible Base64 length ${text.length}`);
+            const padded=text+'='.repeat((4-text.length%4)%4);
+            const raw=Buffer.from(padded,'base64');
+            console.log(`part ${i}: chars=${text.length} bytes=${raw.length} head=${raw.subarray(0,4).toString('hex')} tail=${raw.subarray(-4).toString('hex')}`);
+            rawParts.push(raw);
+          }
+          const gzip=Buffer.concat(rawParts);
+          console.log(`TOTAL gzip bytes=${gzip.length} header=${gzip.subarray(0,8).toString('hex')} tail=${gzip.subarray(-8).toString('hex')}`);
+          if(gzip[0]!==0x1f || gzip[1]!==0x8b || gzip[2]!==0x08) throw new Error('Original payload is not a gzip stream');
+          const app=zlib.gunzipSync(gzip).toString('utf8');
+          console.log(`GUNZIP PASS: source=${app.length} chars sha256=${crypto.createHash('sha256').update(app).digest('hex')}`);
+          new vm.Script(app,{filename:'mutageneses-original-app.js'});
+          fs.writeFileSync('app-core.js',app,'utf8');
+          fs.writeFileSync('original-parts-manifest.json',JSON.stringify(src,null,2));
+          console.log('JAVASCRIPT SYNTAX PASS');
+          NODE
+
+      - name: Verify browser-facing dependencies
+        run: |
+          set -euo pipefail
+          node --check app-core.js
+          node --check cloud-boot.js
+          test -s app-core.js
+          test -s index.html
+          echo "PASS: app-core.js and cloud-boot.js are valid JavaScript"
+
+      - name: Upload recovered source
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-app-source
+          path: |
+            app-core.js
+            original-parts-manifest.json
+          retention-days: 7
+
+      - name: Commit recovered source to recovery branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app-core.js original-parts-manifest.json
+          if git diff --cached --quiet; then
+            echo "Recovered source already committed"
+            exit 0
+          fi
+          git commit -m "recovery: restore verified original application source"
+          git push origin HEAD:recovery/diagnose-segments
